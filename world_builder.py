@@ -637,20 +637,106 @@ def log(line):
     state["log"] = (state["log"] + [line])[-60:]
 
 
-def api_key(prefs):
-    if prefs.api_key:
-        return prefs.api_key
-    if os.environ.get("OPENROUTER_API_KEY"):
-        return os.environ["OPENROUTER_API_KEY"]
+def env_lookup(prefs, var):
+    """os env, then the project .env file, for one variable. Main or worker thread (no bpy)."""
+    if os.environ.get(var):
+        return os.environ[var]
     env_file = (os.path.expanduser(prefs.env_path) if prefs.env_path.strip()
                 else os.path.join(get_dirs(prefs)[0], ".env"))
     try:
         for line in open(env_file):
-            if line.strip().startswith("OPENROUTER_API_KEY"):
+            if line.strip().startswith(var):
                 return line.split("=", 1)[1].strip().strip("'\"")
     except OSError:
         pass
     return None
+
+
+def api_key(prefs):
+    return prefs.api_key or env_lookup(prefs, "OPENROUTER_API_KEY")
+
+
+def polypizza_key(prefs):
+    return prefs.polypizza_key or env_lookup(prefs, "POLYPIZZA_API_KEY")
+
+
+# ------------------------------------------------- CC0 asset sources
+# Style routing: LOWPOLY/STYLIZED/CUSTOM -> Poly Pizza (Kenney/Quaternius packs, GLB, free key);
+# REALISTIC -> PolyHaven photoscan models (glTF + 1k textures, no key). All CC0.
+
+_ph_cache = {}
+
+
+def ph_pick(assets, query):
+    """Pure: best PolyHaven slug for a keyword query — name/slug hits outweigh tag/category hits."""
+    words = [w for w in re.split(r"\W+", (query or "").lower()) if w]
+    best, best_score = None, 0
+    for slug, a in assets.items():
+        names = (slug + " " + a.get("name", "")).lower()
+        tags = " ".join(list(a.get("tags", [])) + list(a.get("categories", []))).lower()
+        score = sum(2 if w in names else (1 if w in tags else 0) for w in words)
+        if score > best_score:
+            best, best_score = slug, score
+    return best
+
+
+def pp_pick(data):
+    """Pure: first Poly Pizza result with a direct download."""
+    for m in data.get("results", []) if isinstance(data, dict) else []:
+        if m.get("Download"):
+            return {"title": m.get("Title") or "asset", "url": m["Download"]}
+    return None
+
+
+_UA = {"User-Agent": "WorldBuilder-Blender-addon/3.6"}  # some CDNs 403 the default Python-urllib UA
+
+
+def _download(url, dest):
+    """Worker thread: download url to dest unless already cached. Returns dest."""
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
+        f.write(r.read())
+    os.replace(tmp, dest)
+    return dest
+
+
+def _get_json(url, headers=None):
+    req = urllib.request.Request(url, headers={**_UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def fetch_asset(query, cfg):
+    """Worker thread: search + download one CC0 model routed by style. -> {name, file} or None."""
+    root = cfg["project_dir"]
+    if cfg["style"] == "REALISTIC":
+        if not _ph_cache:
+            _ph_cache.update(_get_json("https://api.polyhaven.com/assets?type=models"))
+        slug = ph_pick(_ph_cache, query)
+        if not slug:
+            return None
+        entry = _get_json(f"https://api.polyhaven.com/files/{slug}")["gltf"]["1k"]["gltf"]
+        adir = os.path.join(root, "assets", "polyhaven", slug)
+        main = _download(entry["url"], os.path.join(adir, os.path.basename(entry["url"])))
+        for rel, meta in (entry.get("include") or {}).items():
+            _download(meta["url"], os.path.join(adir, rel))
+        return {"name": slug, "file": main}
+    key = cfg.get("pp_key")
+    if not key:
+        return None
+    import urllib.parse
+    data = _get_json("https://api.poly.pizza/v1.1/search/" + urllib.parse.quote(query) + "?Limit=8",
+                     headers={"x-auth-token": key})
+    hit = pp_pick(data)
+    if not hit:
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "-", hit["title"].lower()).strip("-") or "asset"
+    dest = os.path.join(root, "assets", "polypizza", slug, slug + ".glb")
+    return {"name": slug, "file": _download(hit["url"], dest)}
 
 
 def build_system(cfg):
@@ -1860,6 +1946,10 @@ class WB_prefs(bpy.types.AddonPreferences):
     api_key: bpy.props.StringProperty(
         name="OpenRouter API Key", subtype='PASSWORD',
         description="Leave empty to use the OPENROUTER_API_KEY env var or a .env file")
+    polypizza_key: bpy.props.StringProperty(
+        name="Poly Pizza API Key", subtype='PASSWORD',
+        description="Free key from poly.pizza/api for low-poly CC0 assets (Kenney, Quaternius). "
+                    "Leave empty to use the POLYPIZZA_API_KEY env var or the .env file")
     env_path: bpy.props.StringProperty(
         name=".env path", subtype='FILE_PATH', default="",
         description="Optional; empty = <project folder>/.env")
@@ -1869,6 +1959,7 @@ class WB_prefs(bpy.types.AddonPreferences):
     def draw(self, context):
         self.layout.prop(self, "project_dir")
         self.layout.prop(self, "api_key")
+        self.layout.prop(self, "polypizza_key")
         self.layout.prop(self, "env_path")
         self.layout.prop(self, "claude_path")
 
