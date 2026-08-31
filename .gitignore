@@ -1,0 +1,7 @@
+__pycache__/
+.DS_Store
+.env
+renders/
+steps/
+wb_exec.py
+worlds/

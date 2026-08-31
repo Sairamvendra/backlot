@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you build on this project, please cite it as below."
+title: "Backlot (World Builder)"
+type: software
+authors:
+  - given-names: Sairam
+    alias: sairamvendra
+license: GPL-3.0-or-later
+abstract: "A Blender addon that builds, refines, and films 3D worlds from text prompts using an LLM."
