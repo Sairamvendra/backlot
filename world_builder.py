@@ -536,6 +536,12 @@ while changed:
 result = {"removed_empty_collections": removed}
 """
 
+CLEAR_RIG_CODE = """
+import bpy, sys
+wb = sys.modules[__MODULE__]
+result = {"removed": wb.do_clear_rig(bpy.context.scene)}
+"""
+
 SHOT_CRITIQUE_MSG = """Here are renders of the shot's start, middle, and end frames. Check: is the subject
 visible and well composed in ALL three? Does the camera clip into geometry? Does the motion actually cover
 what was requested? Fix any issues by editing the keyframes via run_blender, then reply DONE again."""
@@ -589,7 +595,8 @@ state = {"running": False, "cancel": False, "status": "idle", "log": [],
          "messages": [], "can_refine": False, "last_render": None,
          "usage": {"prompt": 0, "completion": 0}, "cost": 0.0, "started": 0.0,
          "proc": None, "claude_session": None, "built_with": None,
-         "recording": False, "record_done": False}
+         "recording": False, "record_done": False,
+         "shots": [], "film_brief": None, "last_film": None}
 code_q = queue.Queue()  # worker thread -> main thread: (code, reply_queue)
 
 
@@ -762,7 +769,7 @@ def render_to(template, cfg, suffix, half=False):
     return resp.get("result", {}).get("render") if resp.get("status") == "ok" else None
 
 
-def handle_tool_calls(msg, messages):
+def handle_tool_calls(msg, messages, cfg):
     """Execute one assistant message's run_blender calls, appending tool results (both GLM loops)."""
     for call in msg["tool_calls"]:
         if state["cancel"]:
@@ -843,72 +850,90 @@ def record_shot(cfg):
     return None
 
 
-def worker_shot(task_text, key, cfg, resume=False):
-    """OpenRouter backend, shot mode: fresh conversation that animates the CURRENT scene, then records."""
+def shot_convo(messages, key, cfg, has_brief):
+    """Worker thread: the GLM shot loop — converse until the take is keyframed (mutates messages)."""
+    passes_left = cfg["passes"]
+    nudges = anim_retries = 0
+    for turn in range(1, 31):
+        if state["cancel"]:
+            log("cancelled")
+            return
+        state["status"] = f"thinking (turn {turn})..."
+        raw = chat(messages, key, cfg)
+        msg = {"role": "assistant", "content": raw.get("content")}
+        if raw.get("tool_calls"):
+            msg["tool_calls"] = raw["tool_calls"]
+        messages.append(msg)
+        content = (raw.get("content") or "").strip()
+        if msg.get("tool_calls"):
+            handle_tool_calls(msg, messages, cfg)
+            continue
+        if content.upper().startswith("DONE"):
+            log(content[:120])
+            verify = verify_anim()
+            if not (verify.get("camera_animated") or verify.get("any_animated")):
+                anim_retries += 1
+                if anim_retries > 2:
+                    log("still no keyframes after retries; stopping")
+                    return
+                messages.append({"role": "user", "content":
+                                 "Verification found no keyframes or animated camera constraints — the "
+                                 "animation is missing. Add it, then reply DONE again."})
+                continue
+            if passes_left > 0 and not state["cancel"]:
+                passes_left -= 1
+                state["status"] = "rendering check frames..."
+                stills = render_stills(cfg)
+                if stills:
+                    log(f"* shot critique pass ({cfg['passes'] - passes_left}/{cfg['passes']})")
+                    strip_old_images(messages)
+                    crit = SHOT_CRITIQUE_MSG + (SHOT_BRIEF_CHECK if has_brief else "")
+                    messages.append({"role": "user", "content":
+                                     [{"type": "text", "text": crit}]
+                                     + [image_part(p) for p in stills]})
+                    nudges = 0
+                    continue
+            return
+        if content:
+            log(content[:120])
+        nudges += 1
+        if nudges > 2:
+            log("model stopped without DONE")
+            return
+        messages.append({"role": "user", "content":
+                         "Continue with run_blender, or reply DONE: <summary> if finished."})
+
+
+def shoot(task, key, scfg, brief):
+    """Worker thread: keyframe ONE continuous take (backend-dispatched), record it. -> mp4 path or None."""
+    if scfg["model"] == "CLAUDE_CODE":
+        run_claude(claude_shot_prompt(task, scfg), scfg, max_turns=40)
+    else:
+        if brief:
+            task += "\n\n=== FILM DIRECTOR'S SHOT PLAN (keyframe to this) ===\n" + brief
+        messages = [{"role": "system", "content": glm_shot_system(scfg)},
+                    {"role": "user", "content": task}]
+        shot_convo(messages, key, scfg, bool(brief))
+    return None if state["cancel"] else record_shot(scfg)
+
+
+def worker_shot(task_text, key, cfg):
+    """Both backends, shot mode: animate the CURRENT scene, record, remember the take for retakes."""
     try:
         state["started"] = time.time()
-        brief = director_brief(task_text, key, cfg, "shot")
-        if brief:
-            task_text += "\n\n=== FILM DIRECTOR'S SHOT PLAN (keyframe to this) ===\n" + brief
-        messages = [{"role": "system", "content": glm_shot_system(cfg)},
-                    {"role": "user", "content": task_text}]
-        passes_left = cfg["passes"]
-        nudges = anim_retries = 0
-        for turn in range(1, 31):
-            if state["cancel"]:
-                log("cancelled")
-                break
-            state["status"] = f"thinking (turn {turn})..."
-            raw = chat(messages, key, cfg)
-            msg = {"role": "assistant", "content": raw.get("content")}
-            if raw.get("tool_calls"):
-                msg["tool_calls"] = raw["tool_calls"]
-            messages.append(msg)
-            content = (raw.get("content") or "").strip()
-            if msg.get("tool_calls"):
-                handle_tool_calls(msg, messages)
-                continue
-            if content.upper().startswith("DONE"):
-                log(content[:120])
-                verify = verify_anim()
-                if not (verify.get("camera_animated") or verify.get("any_animated")):
-                    anim_retries += 1
-                    if anim_retries > 2:
-                        log("still no keyframes after retries; stopping")
-                        break
-                    messages.append({"role": "user", "content":
-                                     "Verification found no keyframes or animated camera constraints — the "
-                                     "animation is missing. Add it, then reply DONE again."})
-                    continue
-                if passes_left > 0 and not state["cancel"]:
-                    passes_left -= 1
-                    state["status"] = "rendering check frames..."
-                    stills = render_stills(cfg)
-                    if stills:
-                        log(f"* shot critique pass ({cfg['passes'] - passes_left}/{cfg['passes']})")
-                        strip_old_images(messages)
-                        crit = SHOT_CRITIQUE_MSG + (SHOT_BRIEF_CHECK if brief else "")
-                        messages.append({"role": "user", "content":
-                                         [{"type": "text", "text": crit}]
-                                         + [image_part(p) for p in stills]})
-                        nudges = 0
-                        continue
-                break
-            if content:
-                log(content[:120])
-            nudges += 1
-            if nudges > 2:
-                log("model stopped without DONE")
-                break
-            messages.append({"role": "user", "content":
-                             "Continue with run_blender, or reply DONE: <summary> if finished."})
-        if not state["cancel"]:
-            record_shot(cfg)
+        brief = None
+        if cfg["model"] != "CLAUDE_CODE":  # Claude does its own Film Director pass in-prompt
+            brief = director_brief(task_text, key, cfg, "shot")
+        path = shoot(task_text, key, cfg, brief)
+        state["film_brief"] = brief
+        state["shots"] = [{"name": cfg["slug"][:24], "prompt": task_text,
+                           "seconds": cfg["duration"], "path": path}]
         state["status"] = "cancelled" if state["cancel"] else "done"
     except Exception as e:
         log(f"FAILED: {e}")
         state["status"] = "failed"
     finally:
+        state["proc"] = None
         state["running"] = False
 
 
@@ -946,7 +971,7 @@ def worker(task_text, key, cfg, resume=False):
             messages.append(msg)
             content = (raw.get("content") or "").strip()
             if msg.get("tool_calls"):
-                handle_tool_calls(msg, messages)
+                handle_tool_calls(msg, messages, cfg)
                 continue
             if content.upper().startswith("DONE"):
                 log(content[:120])
@@ -1056,7 +1081,7 @@ def run_claude(prompt, cfg, resume_sid=None, max_turns=None):
                             cwd=cfg["project_dir"], text=True, env=env)
     state["proc"] = proc
     state["status"] = "claude code starting..."
-    ok, session_id = False, resume_sid
+    ok, session_id, result_text = False, resume_sid, ""
     for line in proc.stdout:
         if state["cancel"]:
             proc.terminate()
@@ -1085,6 +1110,7 @@ def run_claude(prompt, cfg, resume_sid=None, max_turns=None):
                     log(b["text"].strip().split("\n")[0][:90])
         elif t == "result":
             ok = e.get("subtype") == "success"
+            result_text = str(e.get("result") or "")
             if e.get("total_cost_usd"):
                 state["cost"] += e["total_cost_usd"]
             u = e.get("usage") or {}
@@ -1105,7 +1131,7 @@ def run_claude(prompt, cfg, resume_sid=None, max_turns=None):
         except OSError:
             pass
     os.unlink(errf.name)
-    return ok, session_id
+    return ok, session_id, result_text
 
 
 def worker_claude(task_text, cfg, resume):
@@ -1120,7 +1146,7 @@ def worker_claude(task_text, cfg, resume):
                         "scratch unless the feedback asks for it). End with one line: DONE: <summary>.")
         else:
             prompt = claude_prompt(task_text, cfg)
-        ok, sid = run_claude(prompt, cfg, resume_sid=state.get("claude_session") if resume else None)
+        ok, sid, _text = run_claude(prompt, cfg, resume_sid=state.get("claude_session") if resume else None)
         if sid:
             state["claude_session"] = sid
         if not state["cancel"]:
@@ -1176,22 +1202,6 @@ def claude_shot_prompt(task, cfg):
     return "\n\n".join(parts)
 
 
-def worker_shot_claude(task_text, cfg, resume=False):
-    """Claude Code backend, shot mode: fresh session animates the CURRENT scene, then the addon records."""
-    try:
-        state["started"] = time.time()
-        ok, _sid = run_claude(claude_shot_prompt(task_text, cfg), cfg, max_turns=40)
-        if not state["cancel"]:
-            record_shot(cfg)
-        state["status"] = "cancelled" if state["cancel"] else ("done" if ok else "failed")
-    except Exception as e:
-        log(f"FAILED: {e}")
-        state["status"] = "failed"
-    finally:
-        state["proc"] = None
-        state["running"] = False
-
-
 def start_worker(context, task_text, resume):
     """Main thread: capture settings (threads must never touch bpy), then launch."""
     s = context.scene.world_builder
@@ -1226,8 +1236,8 @@ def start_worker(context, task_text, resume):
     return None
 
 
-def start_shot(context, task_text):
-    """Main thread: capture settings and launch a shot worker on the current scene."""
+def shot_cfg(context, task_text):
+    """Main thread: build the shot cfg dict from settings. Returns (cfg, err) — err is a user message."""
     s = context.scene.world_builder
     prefs = context.preferences.addons[__name__].preferences
     res = RESOLUTIONS[s.resolution]
@@ -1239,20 +1249,26 @@ def start_shot(context, task_text):
            "project_dir": root, "render_dir": render_dir,
            "duration": s.shot_duration, "fps": int(s.shot_fps), "final_quality": s.shot_final,
            "multicut": s.shot_multicut, "multicut_n": s.shot_cuts,
-           "multicam": s.shot_multicam, "multicam_n": s.shot_cams,
+           "multicam": s.shot_multicam, "multicam_n": s.shot_cams, "key": None,
            "slug": re.sub(r"[^a-z0-9]+", "-", task_text.lower())[:40].strip("-") or "shot"}
     if s.model == "CLAUDE_CODE":
         if not os.path.exists(prefs.claude_path):
-            return "claude CLI not found — set its path in Add-on Preferences"
+            return None, "claude CLI not found — set its path in Add-on Preferences"
         cfg["exec_helper"] = ensure_exec_helper(root)
-        target, args = worker_shot_claude, (task_text, cfg)
     else:
-        key = api_key(prefs)
-        if not key:
-            return "No API key — set it in Add-on Preferences or the .env file"
-        target, args = worker_shot, (task_text, key, cfg)
+        cfg["key"] = api_key(prefs)
+        if not cfg["key"]:
+            return None, "No API key — set it in Add-on Preferences or the .env file"
+    return cfg, None
+
+
+def start_shot(context, task_text):
+    """Main thread: capture settings and launch a shot worker on the current scene."""
+    cfg, err = shot_cfg(context, task_text)
+    if err:
+        return err
     state.update(running=True, cancel=False, log=[], status="starting shot...", record_done=False)
-    threading.Thread(target=target, args=args, daemon=True).start()
+    threading.Thread(target=worker_shot, args=(task_text, cfg["key"], cfg), daemon=True).start()
     bpy.app.timers.register(pump, first_interval=0.2)
     return None
 
@@ -1337,6 +1353,31 @@ class WB_OT_shot(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def do_clear_rig(scene):
+    """Main thread: remove shot markers/cameras/keys, restore one static camera. Returns count removed."""
+    removed = len(scene.timeline_markers)
+    scene.timeline_markers.clear()
+    cams = [o for o in scene.objects if o.type == 'CAMERA']
+    original = bpy.data.objects.get("Camera")
+    keep = (original if original in cams else None) or scene.camera or (cams[0] if cams else None)
+    for o in cams:
+        if o is keep:
+            continue
+        if o.name.startswith("ShotCam") or (o.name.startswith("Cam") and o.name != "Camera"):
+            bpy.data.objects.remove(o, do_unlink=True)
+            removed += 1
+    if keep:
+        keep.animation_data_clear()
+        if keep.data:
+            keep.data.animation_data_clear()
+        for c in list(keep.constraints):
+            if c.type in ('TRACK_TO', 'FOLLOW_PATH'):
+                keep.constraints.remove(c)
+        scene.camera = keep
+    scene.frame_set(scene.frame_start)
+    return removed
+
+
 class WB_OT_clear_rig(bpy.types.Operator):
     bl_idname = "world_builder.clear_shot_rig"
     bl_label = "Clear Shot Rig"
@@ -1345,27 +1386,7 @@ class WB_OT_clear_rig(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        scene = context.scene
-        removed = len(scene.timeline_markers)
-        scene.timeline_markers.clear()
-        cams = [o for o in scene.objects if o.type == 'CAMERA']
-        original = bpy.data.objects.get("Camera")
-        keep = (original if original in cams else None) or scene.camera or (cams[0] if cams else None)
-        for o in cams:
-            if o is keep:
-                continue
-            if o.name.startswith("ShotCam") or (o.name.startswith("Cam") and o.name != "Camera"):
-                bpy.data.objects.remove(o, do_unlink=True)
-                removed += 1
-        if keep:
-            keep.animation_data_clear()
-            if keep.data:
-                keep.data.animation_data_clear()
-            for c in list(keep.constraints):
-                if c.type in ('TRACK_TO', 'FOLLOW_PATH'):
-                    keep.constraints.remove(c)
-            scene.camera = keep
-        scene.frame_set(scene.frame_start)
+        removed = do_clear_rig(context.scene)
         self.report({'INFO'}, f"Shot rig cleared ({removed} markers/cameras removed)")
         return {'FINISHED'}
 
