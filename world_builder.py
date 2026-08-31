@@ -304,6 +304,19 @@ def director_task(task_text, cfg, kind):
         parts.append("SCENE REQUEST: " + task_text)
         return "\n".join(parts)
     frames = max(int(cfg["duration"] * cfg["fps"]), 1)
+    if cfg.get("film"):
+        parts = [
+            f"Plan a MULTI-SHOT FILM of about {cfg['duration']:.0f}s total at {cfg['fps']} fps: 2-6 separate "
+            "single-take shots that will be recorded individually and hard-cut together in an editor. "
+            "No cuts INSIDE a shot. Vary size and angle between consecutive shots; put the biggest jump at "
+            "the peak; each shot at least 2s.",
+            "After the prose plan, append EXACTLY ONE fenced block in this precise shape (prompt = a "
+            "self-contained instruction for that one take: size, angle, movement + Blender technique, "
+            "lens mm, subject and framing):\n"
+            '```json\n{"shots": [{"name": "opening-wide", "seconds": 5, "prompt": "..."}]}\n```',
+            "FILM REQUEST: " + task_text,
+        ]
+        return "\n".join(parts)
     parts = [f"Shot duration: {cfg['duration']}s at {cfg['fps']} fps = frames 1-{frames}."]
     if cfg.get("multicut"):
         parts.append(f"Required: {cfg['multicut_n'] or 'a fitting number of'} hard cuts.")
@@ -311,6 +324,31 @@ def director_task(task_text, cfg, kind):
         parts.append(f"Required: {cfg['multicam_n'] or 'several'} distinct cameras with marker-bound switching.")
     parts.append("MOTION REQUEST: " + task_text)
     return "\n".join(parts)
+
+
+def parse_shot_plan(text):
+    """Extract the film shot list from a Film Director brief. None on any failure (soft-fail)."""
+    blocks = re.findall(r"```json\s*\n(.*?)```", text or "", re.S)
+    if not blocks:
+        return None
+    try:
+        raw = json.loads(blocks[-1]).get("shots") or []
+    except (ValueError, AttributeError):
+        return None
+    shots = []
+    for i, s in enumerate(raw[:8]):
+        if not isinstance(s, dict):
+            continue
+        prompt = str(s.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        name = re.sub(r"[^a-z0-9]+", "-", str(s.get("name") or "").lower()).strip("-")
+        try:
+            seconds = min(max(float(s.get("seconds", 5)), 2.0), 20.0)
+        except (TypeError, ValueError):
+            seconds = 5.0
+        shots.append({"name": name or f"shot-{i + 1}", "seconds": seconds, "prompt": prompt})
+    return shots or None
 
 TOOLS = [{
     "type": "function",
