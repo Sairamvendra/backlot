@@ -836,7 +836,9 @@ def chat(messages, key, cfg, tools=True):
     """Backend dispatch — add new backends (e.g. Claude Code) as branches on cfg['model']."""
     model_id = cfg["custom_model"].strip() if cfg["model"] == "CUSTOM" else GLM_ID
     reasoning = {"enabled": False} if cfg["reasoning"] == "OFF" else {"effort": cfg["reasoning"].lower()}
-    payload = {"model": model_id, "messages": messages, "reasoning": reasoning}
+    # cap the completion reservation — without it OpenRouter reserves the model's full budget
+    # per call, which 402s low-credit accounts even though replies are a few thousand tokens
+    payload = {"model": model_id, "messages": messages, "reasoning": reasoning, "max_tokens": 16384}
     if tools:
         payload["tools"] = build_tools(cfg)
     body = json.dumps(payload).encode()
@@ -1190,7 +1192,10 @@ def worker_film(task_text, key, cfg):
                     "slug": f"{cfg['slug'][:20]}-s{i + 1:02d}-{s['name']}"[:56]}
             task = (f"Shot {i + 1} of {len(state['shots'])} of a film. THIS SHOT ONLY — one continuous "
                     f"take, no cuts, no marker cameras: {s['prompt']}")
-            s["path"] = shoot(task, key, scfg, state["film_brief"])
+            try:
+                s["path"] = shoot(task, key, scfg, state["film_brief"])
+            except Exception as e:  # a broken take never kills the film — later takes + assembly still run
+                log(f"  shot error: {str(e)[:80]}")
             log(("  recorded " + os.path.basename(s["path"])) if s["path"] else "  shot failed — continuing")
         if not state["cancel"]:
             assemble_film(cfg)
