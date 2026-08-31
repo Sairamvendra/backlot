@@ -917,6 +917,60 @@ def shoot(task, key, scfg, brief):
     return None if state["cancel"] else record_shot(scfg)
 
 
+def assemble_film(cfg):
+    log("assembly pending (Task 5)")  # replaced in Task 5
+
+
+def worker_film(task_text, key, cfg):
+    """Both backends: Film Director plans N takes -> shoot each -> assemble the cut."""
+    try:
+        state["started"] = time.time()
+        fcfg = {**cfg, "film": True}
+        if cfg["model"] == "CLAUDE_CODE":
+            state["status"] = "film director drafting plan..."
+            plan_prompt = (director_system("shot").split("Answer in exactly")[0]
+                           + "\n" + director_task(task_text, fcfg, "shot")
+                           + "\nDo not run any tools — just answer with the prose plan then the json block.")
+            _ok, _sid, brief = run_claude(plan_prompt, cfg, max_turns=4)
+        else:
+            brief = director_brief(task_text, key, fcfg, "shot")
+        shots = parse_shot_plan(brief)
+        if not shots:
+            log("no parseable shot plan — falling back to a single shot")
+            path = shoot(task_text, key, cfg, brief)
+            state["film_brief"] = brief
+            state["shots"] = [{"name": cfg["slug"][:24], "prompt": task_text,
+                               "seconds": cfg["duration"], "path": path}]
+            state["status"] = "cancelled" if state["cancel"] else "done"
+            return
+        state["film_brief"] = brief
+        state["shots"] = [dict(s, path=None) for s in shots]
+        log(f"shot plan: {len(shots)} takes — " + ", ".join(s["name"] for s in shots))
+        for i, s in enumerate(state["shots"]):
+            if state["cancel"]:
+                break
+            log(f"— shot {i + 1}/{len(state['shots'])}: {s['name']} ({s['seconds']:.0f}s)")
+            try:
+                exec_on_main(CLEAR_RIG_CODE.replace("__MODULE__", json.dumps(__name__)))
+            except queue.Empty:
+                pass
+            scfg = {**cfg, "duration": s["seconds"], "multicut": False, "multicam": False,
+                    "slug": f"{cfg['slug'][:20]}-s{i + 1:02d}-{s['name']}"[:56]}
+            task = (f"Shot {i + 1} of {len(state['shots'])} of a film. THIS SHOT ONLY — one continuous "
+                    f"take, no cuts, no marker cameras: {s['prompt']}")
+            s["path"] = shoot(task, key, scfg, state["film_brief"])
+            log(("  recorded " + os.path.basename(s["path"])) if s["path"] else "  shot failed — continuing")
+        if not state["cancel"]:
+            assemble_film(cfg)
+        state["status"] = "cancelled" if state["cancel"] else "done"
+    except Exception as e:
+        log(f"FAILED: {e}")
+        state["status"] = "failed"
+    finally:
+        state["proc"] = None
+        state["running"] = False
+
+
 def worker_shot(task_text, key, cfg):
     """Both backends, shot mode: animate the CURRENT scene, record, remember the take for retakes."""
     try:
@@ -1273,6 +1327,18 @@ def start_shot(context, task_text):
     return None
 
 
+def start_film(context, task_text):
+    """Main thread: launch the film worker (plan -> batch-shoot -> edit)."""
+    cfg, err = shot_cfg(context, task_text)
+    if err:
+        return err
+    state.update(running=True, cancel=False, log=[], status="starting film...",
+                 record_done=False, shots=[], film_brief=None, last_film=None)
+    threading.Thread(target=worker_film, args=(task_text, cfg["key"], cfg), daemon=True).start()
+    bpy.app.timers.register(pump, first_interval=0.2)
+    return None
+
+
 # ------------------------------------------------------------ operators
 
 class WB_OT_build(bpy.types.Operator):
@@ -1347,6 +1413,29 @@ class WB_OT_shot(bpy.types.Operator):
             self.report({'ERROR'}, "Describe the camera motion first")
             return {'CANCELLED'}
         err = start_shot(context, s.shot_prompt.strip())
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class WB_OT_film(bpy.types.Operator):
+    bl_idname = "world_builder.film"
+    bl_label = "Film Sequence"
+    bl_description = ("Film Director plans 2-6 shots for this request, each is keyframed and recorded "
+                      "as its own take, then the takes are hard-cut together into one MP4. "
+                      "Duration = total film length; multi-cut/multi-cam are ignored per take")
+
+    @classmethod
+    def poll(cls, context):
+        return not state["running"]
+
+    def execute(self, context):
+        s = context.scene.world_builder
+        if not s.shot_prompt.strip():
+            self.report({'ERROR'}, "Describe the film first (subject + mood), e.g. 'dramatic volcano reveal'")
+            return {'CANCELLED'}
+        err = start_film(context, s.shot_prompt.strip())
         if err:
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
@@ -1503,6 +1592,7 @@ class WB_PT_shot(bpy.types.Panel):
         sub.prop(s, "shot_cams", text="")
         col.prop(s, "shot_final")
         col.operator("world_builder.shot", icon='RENDER_ANIMATION')
+        col.operator("world_builder.film", icon='SEQUENCE')
         col.operator("world_builder.clear_shot_rig", icon='TRASH')
         col.label(text="Records MP4 at the Settings resolution")
 
@@ -1641,7 +1731,7 @@ class WB_prefs(bpy.types.AddonPreferences):
         self.layout.prop(self, "claude_path")
 
 
-classes = (WBSettings, WB_OT_build, WB_OT_refine, WB_OT_shot, WB_OT_clear_rig, WB_OT_cancel,
+classes = (WBSettings, WB_OT_build, WB_OT_refine, WB_OT_shot, WB_OT_film, WB_OT_clear_rig, WB_OT_cancel,
            WB_OT_open_renders, WB_OT_save_world, WB_PT_panel, WB_PT_shot, WB_PT_settings, WB_prefs)
 
 

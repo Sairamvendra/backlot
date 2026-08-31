@@ -13,3 +13,9 @@ def test_refactor_surface():
     for k in ("shots", "film_brief", "last_film"):
         assert k in wb.state
     assert "__MODULE__" in wb.CLEAR_RIG_CODE
+
+
+def test_film_surface():
+    assert callable(wb.worker_film) and callable(wb.start_film) and callable(wb.assemble_film)
+    assert wb.WB_OT_film.bl_idname == "world_builder.film"
+    assert any(c.__name__ == "WB_OT_film" for c in wb.classes)
