@@ -1029,6 +1029,40 @@ def worker_film(task_text, key, cfg):
         state["running"] = False
 
 
+def retake_task(shot, note):
+    """Pure: the re-shoot instruction for one rejected take."""
+    return (shot["prompt"] + "\n\nRETAKE — the previous take of this shot was rejected. "
+            "Director's note (top priority): " + note.strip())
+
+
+def worker_retake(ix, note, key, cfg):
+    """Both backends: clear the rig, re-shoot ONE take fresh with the note, re-assemble if needed."""
+    try:
+        state["started"] = time.time()
+        s = state["shots"][ix]
+        log(f"retake {ix + 1}/{len(state['shots'])}: {s['name']}")
+        try:
+            exec_on_main(CLEAR_RIG_CODE.replace("__MODULE__", json.dumps(__name__)))
+        except queue.Empty:
+            pass
+        scfg = {**cfg, "duration": s["seconds"], "multicut": False, "multicam": False,
+                "slug": f"{cfg['slug'][:20]}-s{ix + 1:02d}-{s['name']}-rt"[:56]}
+        path = shoot(retake_task(s, note), key, scfg, state.get("film_brief"))
+        if path:
+            s["path"] = path
+        else:
+            log("retake failed — keeping the previous take")
+        if len(state["shots"]) > 1 and not state["cancel"]:
+            assemble_film(cfg)
+        state["status"] = "cancelled" if state["cancel"] else "done"
+    except Exception as e:
+        log(f"FAILED: {e}")
+        state["status"] = "failed"
+    finally:
+        state["proc"] = None
+        state["running"] = False
+
+
 def worker_shot(task_text, key, cfg):
     """Both backends, shot mode: animate the CURRENT scene, record, remember the take for retakes."""
     try:
@@ -1397,6 +1431,19 @@ def start_film(context, task_text):
     return None
 
 
+def start_retake(context, ix, note):
+    """Main thread: launch a retake of state['shots'][ix]."""
+    if not (0 <= ix < len(state["shots"])):
+        return f"No shot {ix + 1} — the last run recorded {len(state['shots'])} shot(s)"
+    cfg, err = shot_cfg(context, state["shots"][ix]["prompt"])
+    if err:
+        return err
+    state.update(running=True, cancel=False, status="starting retake...", record_done=False)
+    threading.Thread(target=worker_retake, args=(ix, note, cfg["key"], cfg), daemon=True).start()
+    bpy.app.timers.register(pump, first_interval=0.2)
+    return None
+
+
 # ------------------------------------------------------------ operators
 
 class WB_OT_build(bpy.types.Operator):
@@ -1497,6 +1544,29 @@ class WB_OT_film(bpy.types.Operator):
         if err:
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class WB_OT_retake(bpy.types.Operator):
+    bl_idname = "world_builder.retake"
+    bl_label = "Retake Shot"
+    bl_description = ("Re-shoot one take from scratch with your note applied "
+                      "(the shot rig is cleared first), then re-cut the film")
+
+    @classmethod
+    def poll(cls, context):
+        return not state["running"] and bool(state["shots"])
+
+    def execute(self, context):
+        s = context.scene.world_builder
+        if not s.retake_note.strip():
+            self.report({'ERROR'}, "Type a director's note first, e.g. 'slower, wider at the end'")
+            return {'CANCELLED'}
+        err = start_retake(context, s.retake_index - 1, s.retake_note.strip())
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        s.retake_note = ""
         return {'FINISHED'}
 
 
@@ -1652,6 +1722,14 @@ class WB_PT_shot(bpy.types.Panel):
         col.operator("world_builder.shot", icon='RENDER_ANIMATION')
         col.operator("world_builder.film", icon='SEQUENCE')
         col.operator("world_builder.clear_shot_rig", icon='TRASH')
+        if state["shots"] and not state["running"]:
+            col.separator()
+            for i, sh in enumerate(state["shots"]):
+                col.label(text=f"{i + 1:02d} {sh['name'][:30]} {'✓' if sh.get('path') else '✗'}")
+            row = col.row(align=True)
+            row.prop(s, "retake_index")
+            row.prop(s, "retake_note", text="")
+            col.operator("world_builder.retake", icon='FILE_REFRESH')
         col.label(text="Records MP4 at the Settings resolution")
 
 
@@ -1733,6 +1811,12 @@ class WBSettings(bpy.types.PropertyGroup):
     shot_cams: bpy.props.IntProperty(
         name="Cameras", default=0, min=0, max=8,
         description="Number of cameras; 0 = the model chooses")
+    retake_index: bpy.props.IntProperty(
+        name="Shot #", default=1, min=1, max=8,
+        description="Which shot of the last run to retake (1 = first)")
+    retake_note: bpy.props.StringProperty(
+        name="Note", default="",
+        description="Director's note for the retake, e.g. 'slower, keep the tower in frame'")
     model: bpy.props.EnumProperty(
         name="Model", default="GLM_FLASH",
         items=[("GLM_FLASH", "GLM 5.3 Flash", "z-ai/glm-5.3-flash via OpenRouter (was ox-alpha)"),
@@ -1789,8 +1873,9 @@ class WB_prefs(bpy.types.AddonPreferences):
         self.layout.prop(self, "claude_path")
 
 
-classes = (WBSettings, WB_OT_build, WB_OT_refine, WB_OT_shot, WB_OT_film, WB_OT_clear_rig, WB_OT_cancel,
-           WB_OT_open_renders, WB_OT_save_world, WB_PT_panel, WB_PT_shot, WB_PT_settings, WB_prefs)
+classes = (WBSettings, WB_OT_build, WB_OT_refine, WB_OT_shot, WB_OT_film, WB_OT_retake, WB_OT_clear_rig,
+           WB_OT_cancel, WB_OT_open_renders, WB_OT_save_world, WB_PT_panel, WB_PT_shot, WB_PT_settings,
+           WB_prefs)
 
 
 def register():
