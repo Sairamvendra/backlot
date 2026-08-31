@@ -366,6 +366,84 @@ TOOLS = [{
     },
 }]
 
+ASSET_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "import_asset",
+        "description": ("Search a CC0 model library and import the best match into the scene as a new "
+                        "collection. Use for complex PROPS (furniture, vehicles, barrels, creatures, "
+                        "tools) instead of modelling them from primitives. Terrain, buildings, and "
+                        "simple shapes stay procedural. Returns the imported object names and "
+                        "dimensions so you can place and scale them afterwards with run_blender."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "1-3 plain search words, e.g. 'barrel' or 'pine tree'"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def build_tools(cfg):
+    return TOOLS + ([ASSET_TOOL] if cfg.get("assets") else [])
+
+
+IMPORT_CODE = """
+import bpy
+from mathutils import Vector
+before = set(bpy.data.objects)
+bpy.ops.import_scene.gltf(filepath=__PATH__)
+new = [o for o in bpy.data.objects if o not in before]
+col = bpy.data.collections.new(__CNAME__)
+bpy.context.scene.collection.children.link(col)
+for o in new:
+    for c in list(o.users_collection):
+        c.objects.unlink(o)
+    col.objects.link(o)
+root = bpy.data.objects.new(__CNAME__ + "_root", None)
+col.objects.link(root)
+pts = [o.matrix_world @ Vector(b) for o in new if o.type == 'MESH' for b in o.bound_box]
+if pts:
+    lo = [min(p[i] for p in pts) for i in range(3)]
+    hi = [max(p[i] for p in pts) for i in range(3)]
+    root.location = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2])
+    dims = [round(hi[i] - lo[i], 2) for i in range(3)]
+else:
+    dims = None
+for o in new:
+    if o.parent is None:
+        o.parent = root
+        o.matrix_parent_inverse = root.matrix_world.inverted()
+result = {"objects": [o.name for o in new], "root_empty": root.name, "collection": col.name,
+          "dimensions_m": dims,
+          "note": "move/rotate/scale the root empty to place the asset; scale it if dimensions_m "
+                  "is out of proportion with the scene"}
+"""
+
+
+def import_asset_call(args, cfg):
+    """Worker thread: search+download (network), then import on the main thread. Returns tool-result text."""
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "ERROR: empty query"
+    state["status"] = f"importing asset: {query}..."
+    try:
+        got = fetch_asset(query, cfg)
+    except Exception as e:
+        return f"ERROR: asset fetch failed ({e}) — build it from primitives instead."
+    if not got:
+        return f"NO MATCH for '{query}' in the CC0 library — build it from primitives instead."
+    code = (IMPORT_CODE.replace("__PATH__", json.dumps(got["file"]))
+            .replace("__CNAME__", json.dumps("Asset_" + got["name"][:24])))
+    try:
+        return exec_on_main(code, timeout=300)[:8000]
+    except queue.Empty:
+        return "ERROR: import timed out"
+
+
 CAMERA_FALLBACK = """
 import bpy
 from mathutils import Vector
@@ -742,6 +820,13 @@ def fetch_asset(query, cfg):
 def build_system(cfg):
     parts = [BASE_RULES, FLOW_ADD if cfg["add_mode"] else FLOW_REPLACE,
              STYLES[cfg["style"]], DETAILS[cfg["detail"]]]
+    if cfg.get("assets"):
+        src = "PolyHaven photoscans" if cfg["style"] == "REALISTIC" else "Kenney/Quaternius low-poly packs"
+        parts.append(
+            f"ASSET IMPORT: an import_asset tool searches a CC0 library ({src}) and imports the best "
+            "match as a collection with a root empty. Use it for hero and complex props; keep terrain, "
+            "ground, and buildings procedural. After each import, place/rotate/scale the root empty with "
+            "run_blender using the returned dimensions_m, and keep the scene's style consistent.")
     if cfg["extra"].strip():
         parts.append("Additional user requirements (high priority): " + cfg["extra"].strip())
     return "\n".join(p for p in parts if p)
@@ -753,7 +838,7 @@ def chat(messages, key, cfg, tools=True):
     reasoning = {"enabled": False} if cfg["reasoning"] == "OFF" else {"effort": cfg["reasoning"].lower()}
     payload = {"model": model_id, "messages": messages, "reasoning": reasoning}
     if tools:
-        payload["tools"] = TOOLS
+        payload["tools"] = build_tools(cfg)
     body = json.dumps(payload).encode()
     for attempt in range(3):
         req = urllib.request.Request(
@@ -895,10 +980,13 @@ def handle_tool_calls(msg, messages, cfg):
             break
         try:
             args = json.loads(call["function"]["arguments"])
-            step = args.get("step", "build step")
+            step = args.get("step") or args.get("query") or "build step"
             state["status"] = step
             log("> " + step)
-            result = exec_on_main(args["code"])
+            if call["function"]["name"] == "import_asset":
+                result = import_asset_call(args, cfg)
+            else:
+                result = exec_on_main(args["code"])
         except (ValueError, KeyError) as e:
             result = f"ERROR: bad tool arguments: {e}"
         except queue.Empty:
@@ -1282,6 +1370,23 @@ def claude_prompt(task, cfg):
         STYLES[cfg["style"]],
         DETAILS[cfg["detail"]].replace("tool calls", "script runs"),
     ]
+    if cfg.get("assets"):
+        if cfg["style"] == "REALISTIC":
+            api = ("PolyHaven (no key): list models with "
+                   "`https://api.polyhaven.com/assets?type=models` (pick a slug by name/tags), then "
+                   "`https://api.polyhaven.com/files/<slug>` -> data['gltf']['1k']['gltf'] has the main "
+                   "file 'url' plus an 'include' map of relative-path files — download ALL of them "
+                   "preserving relative paths into assets/<slug>/.")
+        else:
+            api = ("Poly Pizza (key in this folder's .env as POLYPIZZA_API_KEY): GET "
+                   "`https://api.poly.pizza/v1.1/search/<query>?Limit=5` with header "
+                   "`x-auth-token: <key>`; download a result's 'Download' .glb into assets/.")
+        parts.append(
+            "ASSET IMPORT (CC0, optional): for complex props, fetch a real model instead of building "
+            "primitives. " + api + " Fetch with python3 urllib or curl (send a browser-like User-Agent "
+            "header — the default python UA gets 403), then import via the helper: "
+            "bpy.ops.import_scene.gltf(filepath='<abs path>'), parent the new objects to a root empty, "
+            "and place/scale it. Keep terrain and buildings procedural.")
     if cfg["extra"].strip():
         parts.append("Additional user requirements (high priority): " + cfg["extra"].strip())
     if cfg["passes"]:
@@ -1301,7 +1406,8 @@ def run_claude(prompt, cfg, resume_sid=None, max_turns=None):
     """Worker thread: spawn headless claude, stream events into the log. Returns (ok, session_id)."""
     cmd = [cfg["claude_bin"], "-p", prompt, "--output-format", "stream-json", "--verbose",
            "--max-turns", str(max_turns or CLAUDE_TURNS[cfg["detail"]]),
-           "--allowedTools", "Bash(python3:*),Bash(echo:*),Read,Write,Glob,Grep"]
+           "--allowedTools", "Bash(python3:*),Bash(echo:*),Read,Write,Glob,Grep"
+                             + (",Bash(curl:*)" if cfg.get("assets") else "")]
     if resume_sid:
         cmd += ["--resume", resume_sid]
     if cfg["claude_model"] != "DEFAULT":
@@ -1449,6 +1555,11 @@ def start_worker(context, task_text, resume):
            "claude_model": s.claude_model, "claude_bin": prefs.claude_path,
            "project_dir": root, "render_dir": render_dir,
            "slug": re.sub(r"[^a-z0-9]+", "-", (s.prompt or "world").lower())[:40].strip("-") or "world"}
+    cfg["assets"] = bool(s.use_assets)
+    cfg["pp_key"] = polypizza_key(prefs)
+    if cfg["assets"] and s.style != "REALISTIC" and not cfg["pp_key"]:
+        cfg["assets"] = False
+        log("asset import off — no Poly Pizza key (prefs or POLYPIZZA_API_KEY in .env)")
     if kind == "CLAUDE_CODE":
         if not os.path.exists(prefs.claude_path):
             return "claude CLI not found — set its path in Add-on Preferences"
@@ -1754,6 +1865,7 @@ class WB_PT_panel(bpy.types.Panel):
         row.prop(s, "style", text="")
         row.prop(s, "detail", text="")
         col.prop(s, "add_mode")
+        col.prop(s, "use_assets")
         col.prop(s, "extra", text="", icon='TEXT')
         col.separator()
         if state["running"]:
@@ -1869,6 +1981,11 @@ class WBSettings(bpy.types.PropertyGroup):
     extra: bpy.props.StringProperty(
         name="Extra instructions", default="",
         description="Optional extra requirements, e.g. 'night time, no cacti, add a river'")
+    use_assets: bpy.props.BoolProperty(
+        name="Import CC0 assets", default=False,
+        description="Let the model import real CC0 props: Kenney/Quaternius low-poly packs via "
+                    "Poly Pizza (needs a free key) for Low Poly/Stylized, PolyHaven photoscans "
+                    "for Realistic")
     refine_text: bpy.props.StringProperty(
         name="Refine", default="",
         description="Feedback for the built world, e.g. 'raise the camera and add more trees'")
