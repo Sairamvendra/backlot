@@ -14,7 +14,7 @@
 bl_info = {
     "name": "World Builder",
     "author": "Sairam (sairamvendra)",
-    "version": (3, 4),
+    "version": (3, 5),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > World Builder",
     "description": "Prompt an LLM (OpenRouter) to build, critique, and refine 3D worlds in the current scene",
@@ -99,6 +99,8 @@ GLM_ID = "z-ai/glm-5.3-flash"  # revealed identity of stealth/ox-alpha
 PRICING = {GLM_ID: (0.075e-6, 0.25e-6)}  # $/token (prompt, completion)
 MAX_TURNS = {"QUICK": 20, "STANDARD": 40, "DETAILED": 60}
 CLAUDE_TURNS = {"QUICK": 25, "STANDARD": 50, "DETAILED": 80}
+RESOLUTIONS = {"R720": (1280, 720), "R1080": (1920, 1080), "SQUARE": (1080, 1080),
+               "VERT916": (1080, 1920), "UW219": (2560, 1080)}
 
 # ---------------------------------------------------------------- prompts
 
@@ -157,6 +159,158 @@ CRITIQUE_MSG = """Here is a render of the current scene. Compare it against the 
 Identify the top issues — camera framing/composition, color and contrast, lighting mood, object spacing
 (overlaps, floating objects), missing or malformed elements — and FIX them now with run_blender calls.
 Then reply DONE: <summary> again."""
+
+BRIEF_CHECK = """
+Also grade the render against the Creative Director's brief above: is the focal point actually dominant
+(size, light, accent color)? Is the palette holding 60/30/10 with saturation only at the focal? Does the
+lighting match the recipe? Are clusters grounded, varied, and separated by rest areas? Fix what misses."""
+
+SHOT_BRIEF_CHECK = """
+Also check each frame against the Film Director's shot plan above: right shot size, angle, movement, and
+lens per cut? Fix deviations by editing the keyframes."""
+
+# ------------------------------------------- director knowledge bases
+# Creative KB distilled from docs/art-direction-research.md (production design, concept
+# art, level design, CG lighting). Film KB distilled from cinematography shot-grammar
+# research (shot sizes / angles / movements / lenses) plus Blender technique mappings.
+
+CREATIVE_KB = """ART-DIRECTION PRINCIPLES
+
+STORY & WORLD
+- Boil the request to ONE mood word; every object, color, and light must serve it.
+- Give the place one line of backstory (who lives here, what just happened); let it dictate materials and wear.
+- Every prop is evidence — who put it here, when, why HERE. A minimum story is 3 related props (axe + stump +
+  woodpile). Stage one interrupted action (cart mid-load, tools at a half-mended fence, door left ajar).
+- Materials obey geography (build from what is locally abundant); one era = one construction logic (matching
+  door heights, roof pitches, ornament) unless a mismatch IS the story.
+
+COMPOSITION — what makes the image read
+- Exactly ONE focal structure; design outward from it. Stack cues on it: tallest (2-4x its neighbors, which
+  stay under ~1/2 its height), brightest light, strongest value contrast, the accent color, highest detail,
+  a clean isolated silhouette with a clutter-free base.
+- Big/Medium/Small: 1 dominant mass, 2-4 medium supports, many small accents, in obvious 2-3x size steps;
+  odd counts (3/5) for similar items; at most 1-2 secondary interest points, clearly weaker.
+- Aim 1-2 leading lines at the focal: an S-curved path, fence line, stream, or tree row from a lower frame corner.
+- Three depth layers from the camera: a darker simple foreground element near a frame edge, the focal in the
+  lit midground, a calm desaturated background; layers overlap — no floating islands of props.
+- Shape motif per mood — round = friendly/safe, square = stable/ordered, triangle/diagonal = danger/tension;
+  bias the big masses toward it and break it exactly once, at the focal.
+- Detail budget 70/30: the focal and the route to it carry ~70% of the detail; 30-50% of the scene stays calm
+  rest area. Bring 3 hero objects to full detail rather than 30 to half.
+
+PLACEMENT — what makes it believable
+- Cluster, don't scatter: groups of 2-5 related objects with real gaps between groups (gap >= cluster width).
+- Vary every organic duplicate: rotation free, scale +/-10-25%, slight tilt; manufactured repeats (posts,
+  lamps) keep identical scale but get small spacing/rotation jitter; 5-10% of any man-made series is broken,
+  leaning, or missing.
+- Orient by use: benches face views, tools face their work, signs face the road, chairs face tables; only
+  debris is random.
+- Ground everything: sink bases slightly into the terrain; dress 30-60% of each building's base line with
+  grass tufts, stones, or dirt; wear goes where feet and hands go (path centers worn bare with irregular
+  edges, thresholds, handles).
+- Human anchor in every view: door 2-2.2m, seat 0.45m, table 0.75m, fence 1m, one-story house 3-4m, mature
+  trees 8-15m (taller than a cottage). Any size that can't be justified against a 1.8m human is wrong.
+- Vegetation clumps boldly: dense near water and walls, bare gaps elsewhere; shrubs cluster AROUND trees;
+  forest edges fade out over a band, never a hard line.
+
+COLOR & LIGHT
+- Palette 60/30/10: dominant hue family on the large surfaces (ground, sky, biggest objects), secondary on
+  mids, and the saturated accent ONLY on/near the focal. 2-3 hue families plus neutrals biased toward the
+  dominant; most surfaces under ~0.25 saturation.
+- Value before color: the scene must read as 2-3 value masses; maximum light-dark contrast at the focal ONLY
+  (light focal on dark surround, or dark on light).
+- ONE shadow-casting key light, 30-60 degrees off the camera axis (3/4 backlight gives the best depth); warm
+  key = cool shadows and vice versa. The world background is the fill light and tints every shadow — always
+  set it deliberately, never default grey.
+- Key:fill ratio is the mood dial: ~2:1 cheerful, ~4:1 drama, ~8:1 noir/tension.
+- Time-of-day recipes (Blender sun): golden hour = elevation 5-15 deg, color (1.0, 0.72, 0.45), angle 2-3 deg,
+  warm horizon / desaturated blue sky; midday = elevation 50-70 deg, (1.0, 0.95, 0.9), angle 0.5 deg, hard
+  shadows, cool shadow fill; overcast = weak sun with angle 15 deg+, world a light cool grey
+  (0.75, 0.78, 0.82), object colors dominate; night = moon (0.6, 0.7, 0.9) at low strength, elevation
+  30-60 deg, world near-black blue (~0.02), keep the blue desaturated; a warm practical (1.0, 0.6, 0.35) at
+  dusk or night is an instant focal accent.
+- Atmosphere: near = warmer/saturated/contrasty, far = cooler/desaturated/flat; light haze separates depth
+  layers better than geometry can."""
+
+FILM_KB = """CINEMATOGRAPHY PRINCIPLES
+
+SHOT SIZES: EWS = subject tiny in a vast environment (awe, scale, isolation) | WS = whole subject plus
+surroundings (context, geography) | MS = mid distance (action, natural engagement) | MCU/CU = close on the
+subject or one part (emotion, intimacy) | ECU/INSERT = a single detail fills the frame (intensity, a clue).
+ANGLES: eye level ~1.6m = neutral | low, looking up = subject powerful/imposing | high, looking down =
+subject small/vulnerable | bird's-eye straight down = map-like overview | worm's-eye from the ground =
+overwhelming scale | Dutch roll 5-15 deg = unease, chaos | high aerial sweep = epic scope, openings/transitions.
+MOVEMENTS — each with its Blender technique:
+- static hold: no camera keys; let scene motion play
+- push-in / pull-out: location keys toward/away from the subject (tension builds / context reveals)
+- pan / tilt: rotation keys from a fixed position (survey, reveal, follow)
+- tracking / truck: location keys parallel to the subject's travel; aim with TRACK_TO on an (animated) empty
+- orbit / arc: FOLLOW_PATH on a circle around the subject, key offset_factor with use_fixed_location=True
+  (hero moment, transformation)
+- crane: Z location keys + TRACK_TO (rising = freedom/scale, descending = grounding/arrival)
+- dolly zoom: counter-key camera location and cam.data.lens (background warps — dread, realization)
+- rack focus: enable cam.data.dof and key focus_distance between subjects (redirects attention)
+- handheld: small noise F-curve modifiers on rotation (urgency, realism)
+- whip pan: very fast rotation keys (energy; use as a transition between cuts)
+LENSES (cam.data.lens, mm): 18-35 wide = immersive, exaggerates depth and speed — establishing/tracking;
+35-65 normal = human-eye honest; 70-200 telephoto = compresses layers, isolates the subject (romantic,
+voyeuristic). Wide lens + low close camera = towering drama; long lens + distance = flattened postcard layers.
+COMPOSITION IN MOTION: keep the subject at a thirds intersection with lead room in its direction of travel;
+low horizon = epic sky and looming subjects, high horizon = terrain patterns; pass a foreground element near
+the lens during moves for depth; start AND end every shot on a readable composition; never clip geometry.
+PACING: one idea per shot; slow = contemplative/ominous, fast = urgent; always ease in/out (BEZIER handles);
+at every cut change BOTH size and angle (wide -> medium -> close beats same-size cuts); hold each cut at
+least 2 seconds; put the biggest size jump at the story's peak.
+GENRE DEFAULTS: action = wide + tracking/handheld, low angles, fast cuts | drama = MS/MCU, eye level, slow
+push-in | horror/thriller = Dutch + creeping push-in, dolly zoom, low/high mix | romance = CU, arc move,
+telephoto, rack focus | epic/fantasy = EWS + crane/aerial, low angle on the hero, wide lens | documentary =
+eye level, pans and tracks, normal lens."""
+
+
+def director_system(kind):
+    if kind == "scene":
+        return ("You are the CREATIVE DIRECTOR for a 3D scene about to be built in Blender. Turn the request "
+                "into a short, specific art-direction brief that a 3D artist will execute. No code, no "
+                "preamble, under 350 words. Answer in exactly this format:\n"
+                "MOOD: <one word> — <one-line story of this place>\n"
+                "FOCAL POINT: <the one hero element>, where it sits, how it dominates (size/light/accent/detail)\n"
+                "LAYOUT: big/medium/small masses; the clusters and their contents; the leading line; the "
+                "foreground framing element; where the rest areas are\n"
+                "PALETTE: dominant <color>, secondary <color>, accent <color> (focal only); material notes\n"
+                "LIGHTING: time of day; sun elevation/angle/RGB; world color; key:fill ratio; any accent light\n"
+                "CAMERA: height, lens feel, and what the frame shows (foreground / focal / background)\n"
+                "STORY BEATS: 3-5 prop clusters that tell the story (objects + the why)\n"
+                "AVOID: the 3 most likely mistakes for THIS scene\n\n" + CREATIVE_KB)
+    return ("You are the FILM DIRECTOR planning camera work for an EXISTING 3D scene in Blender. Turn the "
+            "motion request into a short shot plan that a cinematographer will keyframe. You have not seen "
+            "the scene, so name subjects generically from the request — the cinematographer inspects the "
+            "scene first and adapts positions. No code, no preamble, under 300 words. Answer in exactly "
+            "this format:\n"
+            "INTENT: what this camera work communicates\n"
+            "SHOTS: one numbered line per shot/cut — frames <start-end>: <size> from <angle>, <movement + "
+            "Blender technique>, lens <mm>, subject + framing\n"
+            "PACING: speed and easing notes tied to the mood\n"
+            "AVOID: 2-3 likely mistakes for THIS move\n\n" + FILM_KB)
+
+
+def director_task(task_text, cfg, kind):
+    if kind == "scene":
+        parts = [STYLES[cfg["style"]] or "Style: user-defined.", DETAILS[cfg["detail"]]]
+        if cfg["add_mode"]:
+            parts.append("NOTE: this ADDS to an existing scene — brief only the new content and how it "
+                         "ties in with what exists; do not re-plan the whole scene.")
+        if cfg["extra"].strip():
+            parts.append("User requirements: " + cfg["extra"].strip())
+        parts.append("SCENE REQUEST: " + task_text)
+        return "\n".join(parts)
+    frames = max(int(cfg["duration"] * cfg["fps"]), 1)
+    parts = [f"Shot duration: {cfg['duration']}s at {cfg['fps']} fps = frames 1-{frames}."]
+    if cfg.get("multicut"):
+        parts.append(f"Required: {cfg['multicut_n'] or 'a fitting number of'} hard cuts.")
+    if cfg.get("multicam"):
+        parts.append(f"Required: {cfg['multicam_n'] or 'several'} distinct cameras with marker-bound switching.")
+    parts.append("MOTION REQUEST: " + task_text)
+    return "\n".join(parts)
 
 TOOLS = [{
     "type": "function",
@@ -429,12 +583,14 @@ def build_system(cfg):
     return "\n".join(p for p in parts if p)
 
 
-def chat(messages, key, cfg):
+def chat(messages, key, cfg, tools=True):
     """Backend dispatch — add new backends (e.g. Claude Code) as branches on cfg['model']."""
     model_id = cfg["custom_model"].strip() if cfg["model"] == "CUSTOM" else GLM_ID
     reasoning = {"enabled": False} if cfg["reasoning"] == "OFF" else {"effort": cfg["reasoning"].lower()}
-    body = json.dumps({"model": model_id, "messages": messages, "tools": TOOLS,
-                       "reasoning": reasoning}).encode()
+    payload = {"model": model_id, "messages": messages, "reasoning": reasoning}
+    if tools:
+        payload["tools"] = TOOLS
+    body = json.dumps(payload).encode()
     for attempt in range(3):
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions", data=body,
@@ -460,6 +616,24 @@ def chat(messages, key, cfg):
             raise RuntimeError(err)
         log(f"retrying: {err[:70]}")
         time.sleep(5 * (attempt + 1))
+
+
+def director_brief(task_text, key, cfg, kind):
+    """One no-tools LLM call: turn the request into an art-direction / shot brief. Never fatal."""
+    role = "creative director" if kind == "scene" else "film director"
+    state["status"] = f"{role} drafting brief..."
+    try:
+        raw = chat([{"role": "system", "content": director_system(kind)},
+                    {"role": "user", "content": director_task(task_text, cfg, kind)}],
+                   key, cfg, tools=False)
+        brief = (raw.get("content") or "").strip()
+        if brief:
+            log(f"{role}: brief ready ({len(brief.split())} words)")
+            return brief
+        log(f"{role}: empty brief — building without one")
+    except Exception as e:
+        log(f"{role} pass skipped: {str(e)[:70]}")
+    return None
 
 
 def exec_on_main(code, timeout=600):
@@ -635,6 +809,9 @@ def worker_shot(task_text, key, cfg, resume=False):
     """OpenRouter backend, shot mode: fresh conversation that animates the CURRENT scene, then records."""
     try:
         state["started"] = time.time()
+        brief = director_brief(task_text, key, cfg, "shot")
+        if brief:
+            task_text += "\n\n=== FILM DIRECTOR'S SHOT PLAN (keyframe to this) ===\n" + brief
         messages = [{"role": "system", "content": glm_shot_system(cfg)},
                     {"role": "user", "content": task_text}]
         passes_left = cfg["passes"]
@@ -672,8 +849,9 @@ def worker_shot(task_text, key, cfg, resume=False):
                     if stills:
                         log(f"* shot critique pass ({cfg['passes'] - passes_left}/{cfg['passes']})")
                         strip_old_images(messages)
+                        crit = SHOT_CRITIQUE_MSG + (SHOT_BRIEF_CHECK if brief else "")
                         messages.append({"role": "user", "content":
-                                         [{"type": "text", "text": SHOT_CRITIQUE_MSG}]
+                                         [{"type": "text", "text": crit}]
                                          + [image_part(p) for p in stills]})
                         nudges = 0
                         continue
@@ -699,6 +877,7 @@ def worker_shot(task_text, key, cfg, resume=False):
 def worker(task_text, key, cfg, resume=False):
     try:
         state["started"] = time.time()
+        brief = None
         if resume:
             messages = state["messages"]
             strip_old_images(messages)
@@ -710,6 +889,9 @@ def worker(task_text, key, cfg, resume=False):
                 content.append(image_part(state["last_render"]))
             messages.append({"role": "user", "content": content})
         else:
+            brief = director_brief(task_text, key, cfg, "scene")
+            if brief:
+                task_text += "\n\n=== CREATIVE DIRECTOR'S BRIEF (build to this) ===\n" + brief
             messages = [{"role": "system", "content": build_system(cfg)},
                         {"role": "user", "content": task_text}]
         passes_left = cfg["passes"]
@@ -737,8 +919,9 @@ def worker(task_text, key, cfg, resume=False):
                     if path:
                         log(f"* critique pass ({cfg['passes'] - passes_left}/{cfg['passes']})")
                         strip_old_images(messages)
+                        crit = CRITIQUE_MSG + (BRIEF_CHECK if brief else "")
                         messages.append({"role": "user",
-                                         "content": [{"type": "text", "text": CRITIQUE_MSG}, image_part(path)]})
+                                         "content": [{"type": "text", "text": crit}, image_part(path)]})
                         nudges = 0
                         continue
                 break
@@ -793,6 +976,12 @@ def claude_transport(cfg):
 def claude_prompt(task, cfg):
     parts = [
         claude_transport(cfg),
+        "STEP 0 — Creative Director pass: before touching Blender, write yourself a short art-direction "
+        "brief for this request (mood word + one-line place story; the ONE focal point and how it dominates; "
+        "big/medium/small layout with clusters, a leading line, and rest areas; 60/30/10 palette; lighting "
+        "recipe with sun elevation/color and world color; camera intent; 3-5 story prop clusters; pitfalls "
+        "to avoid). Ground it in these principles:\n" + CREATIVE_KB +
+        "\nThen build the scene TO THAT BRIEF and judge every critique render against it.",
         "Build incrementally — one logical group per script run. Rules for the Blender code:\n" + SCENE_RULES,
         FLOW_ADD if cfg["add_mode"] else FLOW_REPLACE,
         STYLES[cfg["style"]],
@@ -923,6 +1112,10 @@ def claude_shot_prompt(task, cfg):
         claude_transport(cfg),
         "An existing 3D scene is open in Blender. First run a script that inspects it (object names, rough "
         "bounds, current camera) and reports via `result`. Do NOT delete or rebuild the scene content.",
+        "STEP 0 — Film Director pass: after inspecting the scene, write yourself a short shot plan "
+        "(numbered shots with frame ranges; shot size, angle, movement + technique, lens mm, subject and "
+        "framing per shot; pacing/easing notes; pitfalls). Ground it in these principles:\n" + FILM_KB +
+        "\nThen keyframe TO THAT PLAN and judge your check stills against it.",
         f"Then program this camera shot: set scene.frame_start = 1 and scene.frame_end = {frames} "
         f"({cfg['duration']}s at {cfg['fps']} fps) and keyframe the camera:\n"
         "- Use the existing scene camera, or create 'ShotCam' and set scene.camera.\n"
@@ -968,7 +1161,7 @@ def start_worker(context, task_text, resume):
     kind = "CLAUDE_CODE" if s.model == "CLAUDE_CODE" else "OPENROUTER"
     if resume and state.get("built_with") != kind:
         return "This world was built with the other backend — switch Model back, or rebuild"
-    res = {"R720": (1280, 720), "R1080": (1920, 1080), "SQUARE": (1080, 1080)}[s.resolution]
+    res = RESOLUTIONS[s.resolution]
     root, render_dir, _ = get_dirs(prefs)
     cfg = {"model": s.model, "custom_model": s.custom_model, "reasoning": s.reasoning,
            "passes": s.vision_passes, "resolution": res, "style": s.style, "detail": s.detail,
@@ -999,7 +1192,7 @@ def start_shot(context, task_text):
     """Main thread: capture settings and launch a shot worker on the current scene."""
     s = context.scene.world_builder
     prefs = context.preferences.addons[__name__].preferences
-    res = {"R720": (1280, 720), "R1080": (1920, 1080), "SQUARE": (1080, 1080)}[s.resolution]
+    res = RESOLUTIONS[s.resolution]
     root, render_dir, _ = get_dirs(prefs)
     cfg = {"model": s.model, "custom_model": s.custom_model, "reasoning": s.reasoning,
            "passes": s.vision_passes, "resolution": res, "style": s.style, "detail": s.detail,
@@ -1277,6 +1470,8 @@ class WB_PT_settings(bpy.types.Panel):
         col.prop(s, "vision_passes")
         col.prop(s, "resolution")
         col.prop(s, "backup")
+        prefs = context.preferences.addons[__name__].preferences
+        col.prop(prefs, "project_dir", text="Save folder")
         row = col.row(align=True)
         row.operator("world_builder.open_renders", icon='FILE_FOLDER')
         row.operator("world_builder.save_world", icon='FILE_BLEND')
@@ -1356,7 +1551,10 @@ class WBSettings(bpy.types.PropertyGroup):
         description="After building, render the scene and let the model critique and fix it this many times")
     resolution: bpy.props.EnumProperty(
         name="Resolution", default="R720",
-        items=[("R720", "1280 × 720", ""), ("R1080", "1920 × 1080", ""), ("SQUARE", "1080 × 1080", "")])
+        items=[("R720", "1280 × 720", "16:9 HD"), ("R1080", "1920 × 1080", "16:9 Full HD"),
+               ("SQUARE", "1080 × 1080", "1:1 square"),
+               ("VERT916", "1080 × 1920", "9:16 vertical — Reels/Shorts/TikTok"),
+               ("UW219", "2560 × 1080", "21:9 ultrawide — cinematic")])
     backup: bpy.props.BoolProperty(
         name="Backup scene before replacing", default=True,
         description="Save a .blend copy to the worlds folder before a replace-mode build")

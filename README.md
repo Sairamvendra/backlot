@@ -5,13 +5,17 @@
 Backlot is a Blender addon (4.2+ / 5.x) that builds, refines, and films 3D worlds from text prompts
 using an LLM. (It registers in Blender's add-on list as **World Builder**.)
 
-**Features**: prompt-to-world building with style/detail presets · vision critique passes (the model
-sees its own render and fixes it) · iterative refine box · add-to-scene or replace mode with auto-backup ·
-editable scene structure (grouped objects, see below) · camera shots: prompt-driven animation with
-duration/fps, multi-cut and multi-cam (marker-bound camera switching), fast OpenGL viewport capture or
-full-quality render to MP4, one-click Clear Shot Rig · model backends: OpenRouter (default
-`z-ai/glm-5.3-flash`, any custom model ID, reasoning effort selector) or local headless Claude Code
-(runs on your subscription).
+**Features**: prompt-to-world building with style/detail presets · **director brains**: a Creative
+Director pass turns your prompt into an art-direction brief (mood, focal point, 60/30/10 palette,
+lighting recipe, story prop clusters) and a Film Director pass turns motion requests into a shot plan
+(sizes, angles, movements, lenses, per-cut frame ranges) before anything is built — both distilled from
+film production design, concept art, level design, and cinematography practice · vision critique passes
+(the model sees its own render and grades it against the brief) · iterative refine box · add-to-scene or
+replace mode with auto-backup · editable scene structure (grouped objects, see below) · camera shots:
+prompt-driven animation with duration/fps, multi-cut and multi-cam (marker-bound camera switching), fast
+OpenGL viewport capture or full-quality render to MP4, one-click Clear Shot Rig · model backends:
+OpenRouter (default `z-ai/glm-5.3-flash`, any custom model ID, reasoning effort selector) or local
+headless Claude Code (runs on your subscription).
 
 ## Install
 
