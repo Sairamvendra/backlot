@@ -13,9 +13,13 @@ film production design, concept art, level design, and cinematography practice �
 (the model sees its own render and grades it against the brief) · iterative refine box · add-to-scene or
 replace mode with auto-backup · editable scene structure (grouped objects, see below) · camera shots:
 prompt-driven animation with duration/fps, multi-cut and multi-cam (marker-bound camera switching), fast
-OpenGL viewport capture or full-quality render to MP4, one-click Clear Shot Rig · model backends:
-OpenRouter (default `z-ai/glm-5.3-flash`, any custom model ID, reasoning effort selector) or local
-headless Claude Code (runs on your subscription).
+OpenGL viewport capture or full-quality render to MP4, one-click Clear Shot Rig · **Film Sequence
+(v3.6)**: the Film Director plans 2–6 single-take shots, each is shot and recorded independently, then
+hard-cut into one film in a kept `WB_Edit` VSE scene · **retakes (v3.6)**: re-shoot any one shot with a
+director's note and the film re-cuts automatically · **CC0 asset import (v3.6, opt-in)**: real props
+pulled in by style — Kenney/Quaternius low-poly packs via Poly Pizza, PolyHaven photoscans for Realistic ·
+model backends: OpenRouter (default `z-ai/glm-5.3-flash`, any custom model ID, reasoning effort
+selector) or local headless Claude Code (runs on your subscription).
 
 ## Install
 
@@ -29,6 +33,8 @@ headless Claude Code (runs on your subscription).
 - **Project folder** — where `renders/`, `worlds/`, `steps/`, and `.env` live (default `~/Documents/WorldBuilder`).
 - **OpenRouter API key** — paste it here, **or** export `OPENROUTER_API_KEY`, **or** put
   `OPENROUTER_API_KEY=...` in `<project folder>/.env`. Never commit `.env` (see `.gitignore`).
+- **Poly Pizza API key** (optional) — free key from [poly.pizza/api](https://poly.pizza/api), only
+  needed for CC0 asset import in Low Poly/Stylized styles; same three ways (`POLYPIZZA_API_KEY`).
 - **claude CLI path** — auto-detected; only needed for the Claude Code backend.
 
 ## Scene structure: objects behave like layer folders
@@ -55,6 +61,32 @@ count (0 = the model chooses). Recording defaults to a fast OpenGL viewport capt
 shading; enable **Final quality render** for the full engine (slower; ESC in the render window stops it).
 **Clear Shot Rig** removes shot cameras, markers, and camera animation afterwards, restoring one static
 camera — undo-able.
+
+## Film Sequence & retakes (v3.6)
+
+Describe a film ("cinematic tour inside the spaceship, tense and quiet"), set the **total** length, and
+hit **Film Sequence**. The Film Director plans 2–6 single-take shots (machine-readable shot list), each
+take is keyframed and recorded on a clean rig, then the takes are hard-cut together in a new `WB_Edit`
+scene and rendered to `<slug>-film-<ts>.mp4`. The `WB_Edit` scene stays in your .blend so you can re-trim
+the cut by hand in the VSE. If the plan can't be parsed, the run falls back to the classic single-shot
+behavior — you always get a video. A failed take is skipped, never fatal.
+
+After a run, the panel shows the shot board (`01 corridor-push ✓ …`). Pick a shot number, type a
+director's note ("slower, hold longer on the viewport"), and hit **Retake Shot** — that one take is
+re-shot from scratch with your note as top priority and the film re-cuts automatically. Notes don't
+accumulate across repeated retakes of the same shot, so write the full note each time. Sound is the
+planned v3.7 follow-up.
+
+## CC0 asset import (v3.6, opt-in)
+
+Tick **Import CC0 assets** in the main panel and the builder gains an `import_asset` tool for complex
+props (furniture, vehicles, barrels...) instead of modelling everything from primitives — terrain and
+buildings stay procedural. Sources are routed by style, all CC0 (no attribution required, credited
+anyway): **Low Poly / Stylized / Custom** → [Poly Pizza](https://poly.pizza) (Kenney, Quaternius, and
+the Google Poly archive; needs the free key above — without it the toggle quietly turns itself off) ·
+**Realistic** → [PolyHaven](https://polyhaven.com) photoscan models with 1k textures (no key). Downloads
+are cached under `<project folder>/assets/` and imported as a collection under a root empty, so imported
+props move like every other Backlot object. Credits: Kenney, Quaternius, Poly Haven.
 
 ## Notes
 

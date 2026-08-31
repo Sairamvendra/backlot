@@ -14,7 +14,7 @@
 bl_info = {
     "name": "World Builder",
     "author": "Sairam (sairamvendra)",
-    "version": (3, 5),
+    "version": (3, 6),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > World Builder",
     "description": "Prompt an LLM (OpenRouter) to build, critique, and refine 3D worlds in the current scene",
@@ -631,7 +631,7 @@ edit.render.fps = __FPS__
 edit.render.resolution_x, edit.render.resolution_y = __W__, __H__
 edit.sequence_editor_create()
 se = edit.sequence_editor
-seqs = getattr(se, "strips", None) or se.sequences  # Blender 5.x renamed sequences -> strips
+seqs = se.strips if hasattr(se, "strips") else se.sequences  # 5.x renamed sequences -> strips (empty is falsy!)
 frame = 1
 for i, p in enumerate(paths):
     strip = seqs.new_movie(name="shot%02d" % (i + 1), filepath=p, channel=1, frame_start=frame)
