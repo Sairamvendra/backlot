@@ -542,6 +542,39 @@ wb = sys.modules[__MODULE__]
 result = {"removed": wb.do_clear_rig(bpy.context.scene)}
 """
 
+ASSEMBLE_CODE = """
+import bpy, os
+paths, out = __PATHS__, __OUT__
+old = bpy.data.scenes.get("WB_Edit")
+if old:
+    bpy.data.scenes.remove(old)
+edit = bpy.data.scenes.new("WB_Edit")
+edit.render.fps = __FPS__
+edit.render.resolution_x, edit.render.resolution_y = __W__, __H__
+edit.sequence_editor_create()
+se = edit.sequence_editor
+seqs = getattr(se, "strips", None) or se.sequences  # Blender 5.x renamed sequences -> strips
+frame = 1
+for i, p in enumerate(paths):
+    strip = seqs.new_movie(name="shot%02d" % (i + 1), filepath=p, channel=1, frame_start=frame)
+    frame = int(strip.frame_final_end)
+edit.frame_start, edit.frame_end = 1, max(frame - 1, 1)
+if hasattr(edit.render.image_settings, "media_type"):
+    edit.render.image_settings.media_type = 'VIDEO'
+edit.render.image_settings.file_format = 'FFMPEG'
+edit.render.ffmpeg.format = 'MPEG4'
+edit.render.ffmpeg.codec = 'H264'
+edit.render.ffmpeg.constant_rate_factor = 'HIGH'
+edit.render.filepath = out
+prev = bpy.context.window.scene
+bpy.context.window.scene = edit
+try:
+    bpy.ops.render.render(animation=True)
+finally:
+    bpy.context.window.scene = prev
+result = {"film": out, "frames": edit.frame_end, "shots": len(paths)}
+"""
+
 SHOT_CRITIQUE_MSG = """Here are renders of the shot's start, middle, and end frames. Check: is the subject
 visible and well composed in ALL three? Does the camera clip into geometry? Does the motion actually cover
 what was requested? Fix any issues by editing the keyframes via run_blender, then reply DONE again."""
@@ -917,8 +950,33 @@ def shoot(task, key, scfg, brief):
     return None if state["cancel"] else record_shot(scfg)
 
 
+def assemble_code(paths, cfg, out_path):
+    """Pure: fill the VSE assembly template (testable without Blender)."""
+    w, h = cfg["resolution"]
+    return (ASSEMBLE_CODE.replace("__PATHS__", json.dumps(paths)).replace("__OUT__", json.dumps(out_path))
+            .replace("__FPS__", str(cfg["fps"])).replace("__W__", str(w)).replace("__H__", str(h)))
+
+
 def assemble_film(cfg):
-    log("assembly pending (Task 5)")  # replaced in Task 5
+    """Worker thread: hard-cut the recorded takes together in a WB_Edit VSE scene. -> final mp4 or None."""
+    paths = [s["path"] for s in state["shots"] if s.get("path")]
+    if not paths:
+        log("assembly skipped — no recorded takes")
+        return None
+    state["status"] = f"editing {len(paths)} takes..."
+    out = os.path.join(cfg["render_dir"], f"{cfg['slug'][:32]}-film-{int(time.time())}.mp4")
+    n_frames = sum(int(s["seconds"] * cfg["fps"]) for s in state["shots"] if s.get("path"))
+    try:
+        resp = json.loads(exec_on_main(assemble_code(paths, cfg, out), timeout=n_frames * 5 + 300))
+    except queue.Empty:
+        log("assembly timed out")
+        return None
+    if resp.get("status") != "ok":
+        log("assembly error: " + str(resp.get("traceback", ""))[-90:])
+        return None
+    state["last_film"] = out
+    log("film saved: renders/" + os.path.basename(out) + " (edit kept in the WB_Edit scene)")
+    return out
 
 
 def worker_film(task_text, key, cfg):
