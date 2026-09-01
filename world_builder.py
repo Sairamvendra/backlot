@@ -889,8 +889,14 @@ def director_brief(task_text, key, cfg, kind):
     role = "creative director" if kind == "scene" else "film director"
     state["status"] = f"{role} drafting brief..."
     try:
+        task = director_task(task_text, cfg, kind)
+        if cfg.get("ref_image"):
+            task = [{"type": "text", "text": task +
+                     "\n\nThe user's reference image is attached — ground the brief in its "
+                     "objects, layout, and mood."},
+                    image_part(cfg["ref_image"])]
         raw = chat([{"role": "system", "content": director_system(kind)},
-                    {"role": "user", "content": director_task(task_text, cfg, kind)}],
+                    {"role": "user", "content": task}],
                    key, cfg, tools=False)
         brief = (raw.get("content") or "").strip()
         if brief:
@@ -994,8 +1000,9 @@ def pump():
 # ------------------------------------------------------------ the loop
 
 def strip_old_images(messages):
-    """Keep only the newest render in context — old ones just bloat the payload."""
-    for m in messages:
+    """Keep only the newest render in context — old ones just bloat the payload.
+    Skips system + first user message so a user reference image survives refine passes."""
+    for m in messages[2:]:
         if isinstance(m.get("content"), list):
             texts = [p.get("text", "") for p in m["content"] if p.get("type") == "text"]
             m["content"] = "\n".join(texts) + "\n[earlier render omitted]"
@@ -1004,7 +1011,7 @@ def strip_old_images(messages):
 def image_part(path):
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
-    kind = "png" if path.endswith(".png") else "jpeg"
+    kind = "png" if path.lower().endswith(".png") else "jpeg"
     return {"type": "image_url", "image_url": {"url": f"data:image/{kind};base64,{b64}"}}
 
 
@@ -1324,8 +1331,15 @@ def worker(task_text, key, cfg, resume=False):
             brief = director_brief(task_text, key, cfg, "scene")
             if brief:
                 task_text += "\n\n=== CREATIVE DIRECTOR'S BRIEF (build to this) ===\n" + brief
+            user_content = task_text
+            if cfg.get("ref_image"):
+                user_content = [{"type": "text", "text":
+                                 "A reference image is attached. Identify its key objects, layout, "
+                                 "and mood, and build the scene to match it, guided by this request:"
+                                 "\n\n" + task_text},
+                                image_part(cfg["ref_image"])]
             messages = [{"role": "system", "content": build_system(cfg)},
-                        {"role": "user", "content": task_text}]
+                        {"role": "user", "content": user_content}]
         passes_left = cfg["passes"]
         nudges = 0
         for turn in range(1, MAX_TURNS[cfg["detail"]] + 1):
@@ -1438,6 +1452,11 @@ def claude_prompt(task, cfg):
             "and place/scale it. Keep terrain and buildings procedural.")
     if cfg["extra"].strip():
         parts.append("Additional user requirements (high priority): " + cfg["extra"].strip())
+    if cfg.get("ref_image"):
+        parts.append(
+            "REFERENCE IMAGE: the user attached a reference photo at " + cfg["ref_image"] +
+            " — Read it FIRST, identify its key objects, layout, and mood, and build the scene "
+            "to match it, guided by the task and your brief.")
     if cfg["passes"]:
         parts.append(
             f"After building, self-review {cfg['passes']} time(s): render a 640x360 JPEG preview to "
@@ -1604,6 +1623,13 @@ def start_worker(context, task_text, resume):
            "claude_model": s.claude_model, "claude_bin": prefs.claude_path,
            "project_dir": root, "render_dir": render_dir,
            "slug": re.sub(r"[^a-z0-9]+", "-", (s.prompt or "world").lower())[:40].strip("-") or "world"}
+    ref = bpy.path.abspath(s.ref_image).strip() if s.ref_image.strip() else ""
+    if ref:
+        if not os.path.isfile(ref):
+            return "Reference image not found: " + ref
+        if not ref.lower().endswith((".png", ".jpg", ".jpeg")):
+            return "Reference image must be a .png or .jpg file"
+    cfg["ref_image"] = ref
     cfg["assets"] = bool(s.use_assets)
     cfg["pp_key"] = polypizza_key(prefs)
     if cfg["assets"] and s.style != "REALISTIC" and not cfg["pp_key"]:
@@ -2299,6 +2325,8 @@ class WB_PT_panel(bpy.types.Panel):
             bcol.prop(s, "use_assets")
             bcol.prop(s, "extra", text="", icon='TEXT',
                       placeholder="night time, no cacti, add a river")
+            bcol.prop(s, "ref_image", text="", icon='IMAGE_DATA',
+                      placeholder="reference image (optional)")
 
         layout.separator()
         if state["running"]:
@@ -2474,6 +2502,10 @@ class WBSettings(bpy.types.PropertyGroup):
     extra: bpy.props.StringProperty(
         name="Extra instructions", default="",
         description="Optional extra requirements, e.g. 'night time, no cacti, add a river'")
+    ref_image: bpy.props.StringProperty(
+        name="Reference image", default="", subtype='FILE_PATH',
+        description="Optional reference photo (.png/.jpg) — the model identifies its objects, "
+                    "layout, and mood and builds the scene to match, guided by the prompt")
     use_assets: bpy.props.BoolProperty(
         name="Import CC0 assets", default=False,
         description="Let the model import real CC0 props: Kenney/Quaternius low-poly packs via "
