@@ -40,6 +40,11 @@ from io import StringIO
 
 import bpy
 
+try:
+    from mathutils import Vector
+except ImportError:  # pytest fake-bpy environment
+    Vector = None
+
 DEFAULT_PROJECT_DIR = os.path.expanduser("~/Documents/WorldBuilder")
 
 
@@ -109,6 +114,9 @@ RESOLUTIONS = {"R720": (1280, 720), "R1080": (1920, 1080), "SQUARE": (1080, 1080
 SCENE_RULES = """- ALWAYS set `result` to a small JSON-serializable dict: what you created (names, counts, rough positions).
 - Prefer bpy.data over bpy.ops where practical; ops that need UI context fail here.
 - Put each group in its own collection. Ground is at z=0; use sensible real-world scale (a house is 4-6m).
+- Keep the WHOLE scene inside a ~150m footprint. Big subjects (a city, an island, a mountain range)
+  become a compact diorama at reduced scale, NOT true-scale sprawl — cameras, sun angles, and clip
+  distances all assume that envelope.
 - Vary duplicated objects (rotation, scale, position jitter) so nothing looks copy-pasted, and place
   objects so they don't intersect each other or float above the ground.
 - Lighting: one sun (or moon/fill lights) matched to the requested mood, plus a fitting world background color.
@@ -928,6 +936,34 @@ def run_code(code):
         return json.dumps(resp)
 
 
+def fit_clip():
+    """Main thread: grow viewport + camera far-clip to fit the scene so big builds aren't culled.
+
+    Only ever raises clip_end — never shrinks what the user set.
+    """
+    if Vector is None:
+        return
+    try:
+        far = 0.0
+        for o in bpy.context.scene.objects:
+            if o.type not in ('MESH', 'CURVE', 'SURFACE', 'META', 'FONT'):
+                continue
+            for c in o.bound_box:
+                far = max(far, (o.matrix_world @ Vector(c)).length)
+        need = min(100000.0, max(1000.0, far * 6))
+        for window in bpy.data.window_managers[0].windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    sp = area.spaces.active
+                    if sp.clip_end < need:
+                        sp.clip_end = need
+        cam = bpy.context.scene.camera
+        if cam and cam.type == 'CAMERA' and cam.data.clip_end < need:
+            cam.data.clip_end = need
+    except Exception:
+        pass  # cosmetic safety net — never let it break the pump
+
+
 def pump():
     """Timer on the main thread: execute queued code, keep the UI redrawing."""
     try:
@@ -950,6 +986,7 @@ def pump():
     except Exception:
         pass
     if not state["running"] and code_q.empty():
+        fit_clip()  # a finished run is the moment a big build would be culled
         return None
     return 0.2
 

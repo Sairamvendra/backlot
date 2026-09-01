@@ -62,6 +62,8 @@ Every world is built for editing afterwards, Photoshop-layers style:
 - **Backlot Bar** — press **Ctrl+Shift+P** in the viewport (or click the window button in the panel
   header) for a floating prompt bar: Build / Refine / Shot / Film tabs, a multi-line prompt with
   full text editing, one-click Generate; while a job runs it shows live status and a Stop button.
+- After each run the addon auto-raises viewport/camera clip distances to fit the scene, so oversized
+  builds never vanish into far-plane clipping.
 
 ## Camera shots
 
