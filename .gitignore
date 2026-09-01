@@ -1,6 +1,7 @@
 __pycache__/
 .DS_Store
 .env
+assets/
 renders/
 steps/
 wb_exec.py

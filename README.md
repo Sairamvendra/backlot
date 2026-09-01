@@ -55,6 +55,14 @@ Every world is built for editing afterwards, Photoshop-layers style:
 - Replace-mode builds auto-remove empty leftover collections from previous worlds, so the Outliner
   stays clean.
 
+## UI (v3.7)
+
+- Sidebar sections are collapsible (Build Options, Cinematography, Takes, Settings groups) so the
+  tab stays compact; prompt fields pair the input with a live 3–4-line wrapped page while you type.
+- **Backlot Bar** — press **Ctrl+Shift+P** in the viewport (or click the window button in the panel
+  header) for a floating prompt bar: Build / Refine / Shot / Film tabs, a multi-line prompt with
+  full text editing, one-click Generate; while a job runs it shows live status and a Stop button.
+
 ## Camera shots
 
 Describe a motion ("slow 360 orbit, descending", "three-camera coverage cutting between angles"), pick

@@ -14,7 +14,7 @@
 bl_info = {
     "name": "World Builder",
     "author": "Sairam (sairamvendra)",
-    "version": (3, 6),
+    "version": (3, 7),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > World Builder",
     "description": "Prompt an LLM (OpenRouter) to build, critique, and refine 3D worlds in the current scene",
@@ -23,11 +23,13 @@ bl_info = {
 
 import base64
 import json
+import math
 import os
 import queue
 import re
 import subprocess
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -1858,7 +1860,376 @@ class WB_OT_save_world(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ------------------------------------------------------------ prompt bar overlay
+
+try:
+    import blf
+    import gpu
+    from gpu_extras.batch import batch_for_shader
+except ImportError:  # pytest fake-bpy environment / very old builds
+    blf = gpu = batch_for_shader = None
+
+OV_MODES = (("BUILD", "Build"), ("REFINE", "Refine"), ("SHOT", "Shot"), ("FILM", "Film"))
+OV_PROP = {"BUILD": "prompt", "REFINE": "refine_text", "SHOT": "shot_prompt", "FILM": "shot_prompt"}
+OV_PH = {"BUILD": "Describe a world to build…", "REFINE": "Give feedback on the built world…",
+         "SHOT": "Describe one camera move…", "FILM": "Describe the film — subject + mood…"}
+OV_NEON = (0.83, 0.95, 0.18, 1.0)
+
+ov = {"active": False, "close": False, "mode": "BUILD", "caret": 0, "hover": None,
+      "area": None, "region": None, "rects": {}}
+
+
+def _fan(center, ring, color):
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch_for_shader(shader, 'TRI_FAN', {"pos": [center] + ring + [ring[0]]}).draw(shader)
+
+
+def _fill_rr(x, y, w, h, r, color, segs=7):
+    """Filled rounded rect via a triangle fan from the centroid."""
+    r = min(r, w / 2, h / 2)
+    ring = []
+    for cx, cy, a0 in ((x + w - r, y + r, -90), (x + w - r, y + h - r, 0),
+                       (x + r, y + h - r, 90), (x + r, y + r, 180)):
+        for i in range(segs + 1):
+            a = math.radians(a0 + 90 * i / segs)
+            ring.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    _fan((x + w / 2, y + h / 2), ring, color)
+
+
+def _star(cx, cy, r, color):
+    ring = []
+    for i in range(8):
+        rad = r if i % 2 == 0 else r * 0.36
+        a = math.radians(90 + i * 45)
+        ring.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
+    _fan((cx, cy), ring, color)
+
+
+def _wrap_px(f, txt, max_w):
+    """Greedy word-wrap by measured pixel width -> [(start, end, substring)].
+
+    ponytail: O(n^2) blf measuring — prompts are a few hundred chars, fine.
+    """
+    lines, start = [], 0
+    while start <= len(txt):
+        end, last_space = start, -1
+        while end < len(txt):
+            if blf.dimensions(f, txt[start:end + 1])[0] > max_w:
+                break
+            if txt[end] == " ":
+                last_space = end
+            end += 1
+        if end >= len(txt):
+            lines.append((start, len(txt), txt[start:]))
+            break
+        cut = last_space + 1 if last_space >= start else (end if end > start else start + 1)
+        lines.append((start, cut, txt[start:cut]))
+        start = cut
+    return lines or [(0, 0, "")]
+
+
+def draw_overlay():
+    ctx = bpy.context
+    if not ov["active"] or ctx.region != ov["region"]:
+        return
+    region, s = ctx.region, ctx.scene.world_builder
+    running = state["running"]
+    ui = ctx.preferences.system.ui_scale
+    f, fs = 0, int(14 * ui)
+    blf.size(f, fs)
+    line_h = int(fs * 1.55)
+    pad = int(14 * ui)
+    pill_w, pill_h = int(72 * ui), int(40 * ui)
+    bar_w = int(min(660 * ui, region.width - 40 * ui))
+    text_w = bar_w - 2 * pad - pill_w - int(12 * ui)
+    txt = getattr(s, OV_PROP[ov["mode"]])
+    lines = _wrap_px(f, txt, text_w)
+    shown = max(3, min(4, len(lines)))
+    bar_h = 2 * pad + shown * line_h
+    bar_x = (region.width - bar_w) // 2
+    bar_y = int(46 * ui)
+    gpu.state.blend_set('ALPHA')
+
+    _fill_rr(bar_x, bar_y, bar_w, bar_h, int(17 * ui), (0.075, 0.075, 0.082, 0.96))
+    ov["rects"]["bar"] = (bar_x, bar_y, bar_w, bar_h)
+
+    tx0, ty0 = bar_x + pad, bar_y + bar_h - pad - fs
+    if running:
+        mins, secs = divmod(int(time.time() - state["started"]), 60)
+        blf.color(f, 0.9, 0.9, 0.9, 1)
+        blf.position(f, tx0, ty0, 0)
+        blf.draw(f, f"Working · {mins}:{secs:02d}")
+        blf.color(f, 0.55, 0.55, 0.55, 1)
+        blf.position(f, tx0, ty0 - line_h, 0)
+        blf.draw(f, state["status"][:70])
+    elif not txt:
+        blf.color(f, 0.48, 0.48, 0.5, 1)
+        blf.position(f, tx0, ty0, 0)
+        blf.draw(f, OV_PH[ov["mode"]])
+    else:
+        caret = min(ov["caret"], len(txt))
+        li = next((i for i, (a, b, _) in enumerate(lines) if a <= caret <= b), len(lines) - 1)
+        w0 = min(max(0, li - shown + 1), max(0, len(lines) - shown))
+        blf.color(f, 0.93, 0.93, 0.93, 1)
+        for row, (a, b, sub) in enumerate(lines[w0:w0 + shown]):
+            blf.position(f, tx0, ty0 - row * line_h, 0)
+            blf.draw(f, sub)
+        if (time.time() % 1.2) < 0.75 and w0 <= li < w0 + shown:
+            a, b, sub = lines[li]
+            cx = tx0 + blf.dimensions(f, sub[:caret - a])[0]
+            cy = ty0 - (li - w0) * line_h
+            _fill_rr(cx + 1, cy - int(3 * ui), max(2, int(1.6 * ui)), line_h - int(4 * ui), 1, (0.95, 0.95, 0.95, 1))
+
+    px = bar_x + bar_w - pad - pill_w
+    py = bar_y + (bar_h - pill_h) // 2
+    hover_gen = ov["hover"] == "gen"
+    if running:
+        _fill_rr(px, py, pill_w, pill_h, pill_h / 2, (0.78, 0.25, 0.25, 1) if not hover_gen else (0.88, 0.32, 0.32, 1))
+        sq = int(11 * ui)
+        _fill_rr(px + pill_w / 2 - sq / 2, py + pill_h / 2 - sq / 2, sq, sq, int(2 * ui), (0.98, 0.93, 0.93, 1))
+    else:
+        c = OV_NEON if not hover_gen else (0.9, 1.0, 0.32, 1.0)
+        _fill_rr(px, py, pill_w, pill_h, pill_h / 2, c)
+        _star(px + pill_w / 2, py + pill_h / 2, int(11 * ui), (0.06, 0.06, 0.05, 1))
+    ov["rects"]["gen"] = (px, py, pill_w, pill_h)
+
+    tab_y, th = bar_y + bar_h + int(10 * ui), int(30 * ui)
+    tfs = int(12.5 * ui)
+    blf.size(f, tfs)
+    widths = [int(blf.dimensions(f, label)[0]) + int(30 * ui) for _, label in OV_MODES]
+    tx = (region.width - sum(widths) - int(8 * ui) * (len(OV_MODES) - 1)) // 2
+    for (mode_id, label), tw in zip(OV_MODES, widths):
+        active = mode_id == ov["mode"]
+        hov = ov["hover"] == "tab:" + mode_id
+        bg = (0.19, 0.19, 0.2, 1) if active else (0.1, 0.1, 0.11, 0.93) if hov else (0.06, 0.06, 0.066, 0.9)
+        _fill_rr(tx, tab_y, tw, th, th / 2, bg)
+        blf.color(f, *((0.97, 0.97, 0.97, 1) if active else (0.68, 0.68, 0.68, 1)))
+        blf.position(f, tx + int(15 * ui), tab_y + (th - tfs) / 2 + int(1 * ui), 0)
+        blf.draw(f, label)
+        ov["rects"]["tab:" + mode_id] = (tx, tab_y, tw, th)
+        tx += tw + int(8 * ui)
+    gpu.state.blend_set('NONE')
+
+
+class WB_OT_overlay(bpy.types.Operator):
+    bl_idname = "world_builder.overlay"
+    bl_label = "Backlot Bar"
+    bl_description = "Floating prompt bar in the viewport — Build / Refine / Shot / Film (Ctrl+Shift+P)"
+
+    _handle = None
+
+    @classmethod
+    def poll(cls, context):
+        return context.area is not None and context.area.type == 'VIEW_3D'
+
+    def _hit(self, mx, my):
+        for name, (x, y, w, h) in ov["rects"].items():
+            if x <= mx <= x + w and y <= my <= y + h:
+                return name
+        return None
+
+    def invoke(self, context, event):
+        if gpu is None or bpy.app.background:
+            return bpy.ops.world_builder.palette('INVOKE_DEFAULT')
+        if ov["active"]:  # second Ctrl+Shift+P toggles the open bar closed
+            ov["close"] = True
+            return {'CANCELLED'}
+        region = next(r for r in context.area.regions if r.type == 'WINDOW')
+        s = context.scene.world_builder
+        ov.update(active=True, close=False, hover=None, rects={},
+                  area=context.area, region=region,
+                  caret=len(getattr(s, OV_PROP[ov["mode"]])))
+        WB_OT_overlay._handle = bpy.types.SpaceView3D.draw_handler_add(draw_overlay, (), 'WINDOW', 'POST_PIXEL')
+        self._timer = context.window_manager.event_timer_add(0.25, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context):
+        if WB_OT_overlay._handle:
+            bpy.types.SpaceView3D.draw_handler_remove(WB_OT_overlay._handle, 'WINDOW')
+            WB_OT_overlay._handle = None
+        if getattr(self, "_timer", None):
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        ov.update(active=False, close=False, rects={}, hover=None)
+        try:
+            ov["area"].tag_redraw()
+        except (AttributeError, ReferenceError):
+            pass
+        return {'CANCELLED'}
+
+    def _generate(self, context):
+        op = {"BUILD": bpy.ops.world_builder.build,
+              "REFINE": bpy.ops.world_builder.refine,
+              "SHOT": bpy.ops.world_builder.shot,
+              "FILM": bpy.ops.world_builder.film}[ov["mode"]]
+        try:
+            op('INVOKE_DEFAULT')
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e).strip().split("\n")[-1])
+
+    def _edit(self, context, event):
+        s = context.scene.world_builder
+        prop = OV_PROP[ov["mode"]]
+        txt = getattr(s, prop)
+        i = min(ov["caret"], len(txt))
+        k, uni = event.type, event.unicode
+        ctrl = event.ctrl or event.oskey
+        if k == 'BACK_SPACE' and i > 0:
+            txt, i = txt[:i - 1] + txt[i:], i - 1
+        elif k == 'DEL' and i < len(txt):
+            txt = txt[:i] + txt[i + 1:]
+        elif k == 'LEFT':
+            i = max(0, i - 1)
+        elif k == 'RIGHT':
+            i = min(len(txt), i + 1)
+        elif k == 'HOME':
+            i = 0
+        elif k == 'END':
+            i = len(txt)
+        elif ctrl and k == 'V':
+            clip = context.window_manager.clipboard.replace("\r", "").replace("\n", " ")
+            txt, i = txt[:i] + clip + txt[i:], i + len(clip)
+        elif ctrl and k == 'C':
+            context.window_manager.clipboard = txt
+        elif uni and uni.isprintable() and not ctrl:
+            txt, i = txt[:i] + uni + txt[i:], i + len(uni)
+        else:
+            return False
+        if txt != getattr(s, prop):
+            setattr(s, prop, txt)
+        ov["caret"] = i
+        return True
+
+    def modal(self, context, event):
+        if not ov["active"] or ov["close"]:
+            return self._finish(context)
+        if event.type == 'TIMER':
+            try:
+                ov["area"].tag_redraw()
+            except (AttributeError, ReferenceError):
+                return self._finish(context)
+            return {'RUNNING_MODAL'}
+        region = ov["region"]
+        mx, my = event.mouse_x - region.x, event.mouse_y - region.y
+        inside = 0 <= mx <= region.width and 0 <= my <= region.height
+        if not inside:  # let the user work in other areas/editors untouched
+            return {'PASS_THROUGH'}
+        if event.type == 'MOUSEMOVE':
+            hov = self._hit(mx, my)
+            if hov != ov["hover"]:
+                ov["hover"] = hov
+                ov["area"].tag_redraw()
+            return {'PASS_THROUGH'}
+        if event.type in ('MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'):
+            return {'PASS_THROUGH'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            hit = self._hit(mx, my)
+            if hit is None:
+                self._finish(context)
+                return {'PASS_THROUGH'}
+            if hit.startswith("tab:"):
+                ov["mode"] = hit[4:]
+                s = context.scene.world_builder
+                ov["caret"] = len(getattr(s, OV_PROP[ov["mode"]]))
+            elif hit == "gen":
+                if state["running"]:
+                    bpy.ops.world_builder.cancel()
+                else:
+                    self._generate(context)
+            ov["area"].tag_redraw()
+            return {'RUNNING_MODAL'}
+        if event.value == 'PRESS' and event.type not in ('LEFTMOUSE', 'RIGHTMOUSE'):
+            if event.type == 'ESC':
+                return self._finish(context)
+            if event.type in ('RET', 'NUMPAD_ENTER'):
+                if not state["running"]:
+                    self._generate(context)
+                ov["area"].tag_redraw()
+                return {'RUNNING_MODAL'}
+            if not state["running"] and self._edit(context, event):
+                ov["area"].tag_redraw()
+            return {'RUNNING_MODAL'}  # keys are the bar's while the mouse is over the viewport
+        return {'PASS_THROUGH'}
+
+
 # ------------------------------------------------------------ UI
+
+def prompt_block(layout, s, prop, placeholder, wrap=38):
+    """Single-line input + a 3-4 line 'page' box under it: live wrapped text,
+    or a dim hint when empty.
+
+    ponytail: Blender has no multiline string widget and a scale_y-stretched
+    field renders broken (top-anchored text in a huge box), so the box below
+    the input is the multi-line surface (TEXTEDIT_UPDATE keeps it live).
+    """
+    col = layout.column(align=True)
+    col.prop(s, prop, text="", icon='GREASEPENCIL', placeholder=placeholder)
+    box = col.box().column(align=True)
+    box.scale_y = 0.85
+    txt = getattr(s, prop)
+    if txt:
+        lines = textwrap.wrap(txt, wrap)
+        for line in lines[:4]:
+            box.label(text=line)
+        if len(lines) > 4:
+            box.label(text="…")
+        pad = 3 - min(len(lines), 4)
+    else:
+        box.active = False
+        box.label(text=placeholder)
+        pad = 2
+    for _ in range(max(0, pad)):
+        box.label(text="")
+
+
+class WB_OT_palette(bpy.types.Operator):
+    bl_idname = "world_builder.palette"
+    bl_label = "Backlot Prompt"
+    bl_description = "Prompt dialog — pick an action, type, Generate (fallback for the Backlot Bar overlay)"
+
+    mode: bpy.props.EnumProperty(
+        name="Action", default="BUILD",
+        items=[("BUILD", "Build", "Build a world from the prompt"),
+               ("REFINE", "Refine", "Send feedback about the built world"),
+               ("SHOT", "Shot", "Program & record one camera shot"),
+               ("FILM", "Film", "Plan and shoot a multi-shot film")])
+
+    @classmethod
+    def poll(cls, context):
+        return not state["running"]
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=480, confirm_text="Generate")
+
+    def draw(self, context):
+        s = context.scene.world_builder
+        layout = self.layout
+        row = layout.row()
+        row.prop(self, "mode", expand=True)
+        prop, ph = {"BUILD": ("prompt", "a cozy medieval village at dusk"),
+                    "REFINE": ("refine_text", "raise the camera, add more trees"),
+                    "SHOT": ("shot_prompt", "slow 360 orbit, gently descending"),
+                    "FILM": ("shot_prompt", "dramatic volcano reveal at dusk")}[self.mode]
+        prompt_block(layout, s, prop, ph, wrap=68)
+        if self.mode == "REFINE" and not state["can_refine"]:
+            layout.label(text="Nothing to refine yet — build a world first", icon='ERROR')
+
+    def execute(self, context):
+        op = {"BUILD": bpy.ops.world_builder.build,
+              "REFINE": bpy.ops.world_builder.refine,
+              "SHOT": bpy.ops.world_builder.shot,
+              "FILM": bpy.ops.world_builder.film}[self.mode]
+        try:
+            op('INVOKE_DEFAULT')
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e).strip().split("\n")[-1])
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
 
 class WB_PT_panel(bpy.types.Panel):
     bl_idname = "WB_PT_panel"
@@ -1867,78 +2238,136 @@ class WB_PT_panel(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "World Builder"
 
+    def draw_header(self, context):
+        self.layout.label(text="", icon='WORLD_DATA')
+
+    def draw_header_preset(self, context):
+        self.layout.operator("world_builder.overlay", text="", icon='WINDOW', emboss=False)
+
     def draw(self, context):
         s = context.scene.world_builder
-        col = self.layout.column()
-        col.prop(s, "prompt", text="")
+        layout = self.layout
+        col = layout.column()
+        prompt_block(col, s, "prompt", "a cozy medieval village at dusk",
+                     wrap=max(26, int(context.region.width / 7.8)))
         row = col.row(align=True)
         row.prop(s, "style", text="")
         row.prop(s, "detail", text="")
-        col.prop(s, "add_mode")
-        col.prop(s, "use_assets")
-        col.prop(s, "extra", text="", icon='TEXT')
-        col.separator()
+
+        header, body = layout.panel("wb_build_options", default_closed=True)
+        header.label(text="Build Options", icon='OPTIONS')
+        if body:
+            bcol = body.column()
+            bcol.prop(s, "add_mode")
+            bcol.prop(s, "use_assets")
+            bcol.prop(s, "extra", text="", icon='TEXT',
+                      placeholder="night time, no cacti, add a river")
+
+        layout.separator()
         if state["running"]:
-            col.operator("world_builder.cancel", icon='X')
+            row = layout.row()
+            row.scale_y = 1.3
+            row.alert = True
+            row.operator("world_builder.cancel", icon='X')
             mins, secs = divmod(int(time.time() - state["started"]), 60)
-            col.label(text=f"{state['status'][:44]} · {mins}:{secs:02d}")
+            box = layout.box().column(align=True)
+            box.label(text=f"Working · {mins}:{secs:02d}", icon='SORTTIME')
+            box.label(text=state["status"][:52])
         else:
-            col.operator("world_builder.build", text="Build World", icon='PLAY')
-            col.label(text="Status: " + state["status"][:48])
+            row = layout.row()
+            row.scale_y = 1.3
+            row.operator("world_builder.build", text="Build World", icon='PLAY')
+            layout.label(text=state["status"][:52], icon='INFO')
+
         if state["log"]:
-            box = col.box().column(align=True)
-            for line in state["log"][-12:]:
-                box.label(text=line[:55])
+            header, body = layout.panel("wb_activity", default_closed=False)
+            header.label(text="Activity", icon='CONSOLE')
+            if body:
+                box = body.box().column(align=True)
+                box.scale_y = 0.8
+                for line in state["log"][-12:]:
+                    box.label(text=line[:55])
+
         if state["can_refine"] and not state["running"]:
-            col.separator()
-            col.label(text="Refine the world:")
-            row = col.row(align=True)
-            row.prop(s, "refine_text", text="")
-            row.operator("world_builder.refine", text="", icon='CHECKMARK')
+            header, body = layout.panel("wb_refine", default_closed=False)
+            header.label(text="Refine the World", icon='MODIFIER')
+            if body:
+                bcol = body.column(align=True)
+                bcol.prop(s, "refine_text", text="",
+                          placeholder="raise the camera, add more trees")
+                bcol.operator("world_builder.refine", text="Apply Feedback", icon='CHECKMARK')
+
         u = state["usage"]
         if u["prompt"]:
             cost = f" · ${state['cost']:.4f}" if state["cost"] else ""
-            col.label(text=f"tokens {u['prompt']:,} in / {u['completion']:,} out{cost}")
+            row = layout.row()
+            row.active = False
+            row.alignment = 'RIGHT'
+            row.label(text=f"{u['prompt']:,} in / {u['completion']:,} out{cost}")
 
 
 class WB_PT_shot(bpy.types.Panel):
     bl_idname = "WB_PT_shot"
-    bl_label = "Camera Shot"
+    bl_label = "Camera & Film"
     bl_parent_id = "WB_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "World Builder"
 
+    def draw_header(self, context):
+        self.layout.label(text="", icon='CAMERA_DATA')
+
     def draw(self, context):
         s = context.scene.world_builder
-        col = self.layout.column()
-        col.prop(s, "shot_prompt", text="")
+        layout = self.layout
+        col = layout.column()
+        prompt_block(col, s, "shot_prompt", "slow 360 orbit, gently descending",
+                     wrap=max(26, int(context.region.width / 7.8)))
         row = col.row(align=True)
         row.prop(s, "shot_duration")
         row.prop(s, "shot_fps", text="")
-        row = col.row(align=True)
-        row.prop(s, "shot_multicut")
-        sub = row.row(align=True)
-        sub.active = s.shot_multicut
-        sub.prop(s, "shot_cuts", text="")
-        row = col.row(align=True)
-        row.prop(s, "shot_multicam")
-        sub = row.row(align=True)
-        sub.active = s.shot_multicam
-        sub.prop(s, "shot_cams", text="")
-        col.prop(s, "shot_final")
-        col.operator("world_builder.shot", icon='RENDER_ANIMATION')
-        col.operator("world_builder.film", icon='SEQUENCE')
-        col.operator("world_builder.clear_shot_rig", icon='TRASH')
+
+        header, body = layout.panel("wb_cinematography", default_closed=True)
+        header.label(text="Cinematography", icon='SEQ_SEQUENCER')
+        if body:
+            bcol = body.column()
+            row = bcol.row(align=True)
+            row.prop(s, "shot_multicut")
+            sub = row.row(align=True)
+            sub.active = s.shot_multicut
+            sub.prop(s, "shot_cuts", text="")
+            row = bcol.row(align=True)
+            row.prop(s, "shot_multicam")
+            sub = row.row(align=True)
+            sub.active = s.shot_multicam
+            sub.prop(s, "shot_cams", text="")
+            bcol.prop(s, "shot_final")
+
+        acts = layout.column(align=True)
+        acts.scale_y = 1.25
+        acts.operator("world_builder.shot", text="Record Shot", icon='RENDER_ANIMATION')
+        acts.operator("world_builder.film", icon='SEQUENCE')
+        layout.operator("world_builder.clear_shot_rig", icon='TRASH')
+
         if state["shots"] and not state["running"]:
-            col.separator()
-            for i, sh in enumerate(state["shots"]):
-                col.label(text=f"{i + 1:02d} {sh['name'][:30]} {'✓' if sh.get('path') else '✗'}")
-            row = col.row(align=True)
-            row.prop(s, "retake_index")
-            row.prop(s, "retake_note", text="")
-            col.operator("world_builder.retake", icon='FILE_REFRESH')
-        col.label(text="Records MP4 at the Settings resolution")
+            header, body = layout.panel("wb_takes", default_closed=False)
+            header.label(text=f"Takes ({len(state['shots'])})", icon='SEQ_STRIP_DUPLICATE')
+            if body:
+                box = body.box().column(align=True)
+                box.scale_y = 0.9
+                for i, sh in enumerate(state["shots"]):
+                    box.label(text=f"{i + 1:02d}  {sh['name'][:28]}",
+                              icon='CHECKMARK' if sh.get('path') else 'ERROR')
+                bcol = body.column(align=True)
+                row = bcol.row(align=True)
+                row.prop(s, "retake_index")
+                row.prop(s, "retake_note", text="",
+                         placeholder="slower, keep the tower in frame")
+                bcol.operator("world_builder.retake", icon='FILE_REFRESH')
+
+        row = layout.row()
+        row.active = False
+        row.label(text="Records MP4 at the Settings resolution", icon='INFO')
 
 
 class WB_PT_settings(bpy.types.Panel):
@@ -1950,29 +2379,46 @@ class WB_PT_settings(bpy.types.Panel):
     bl_category = "World Builder"
     bl_options = {'DEFAULT_CLOSED'}
 
+    def draw_header(self, context):
+        self.layout.label(text="", icon='PREFERENCES')
+
     def draw(self, context):
         s = context.scene.world_builder
-        col = self.layout.column()
-        col.prop(s, "model")
-        if s.model == "CUSTOM":
-            col.prop(s, "custom_model", text="Model ID")
-        if s.model == "CLAUDE_CODE":
-            col.prop(s, "claude_model")
-        else:
-            col.prop(s, "reasoning")
-        col.prop(s, "vision_passes")
-        col.prop(s, "resolution")
-        col.prop(s, "backup")
-        prefs = context.preferences.addons[__name__].preferences
-        col.prop(prefs, "project_dir", text="Save folder")
-        row = col.row(align=True)
-        row.operator("world_builder.open_renders", icon='FILE_FOLDER')
-        row.operator("world_builder.save_world", icon='FILE_BLEND')
+        layout = self.layout
+
+        header, body = layout.panel("wb_set_ai", default_closed=False)
+        header.label(text="AI Model", icon='EXPERIMENTAL')
+        if body:
+            body.use_property_split = True
+            body.use_property_decorate = False
+            body.prop(s, "model", text="Backend")
+            if s.model == "CUSTOM":
+                body.prop(s, "custom_model", text="Model ID",
+                          placeholder="anthropic/claude-sonnet-5")
+            if s.model == "CLAUDE_CODE":
+                body.prop(s, "claude_model")
+            else:
+                body.prop(s, "reasoning")
+            body.prop(s, "vision_passes", text="Vision Passes")
+
+        header, body = layout.panel("wb_set_output", default_closed=False)
+        header.label(text="Output & Files", icon='OUTPUT')
+        if body:
+            body.use_property_split = True
+            body.use_property_decorate = False
+            body.prop(s, "resolution")
+            body.prop(s, "backup", text="Backup Scene")
+            prefs = context.preferences.addons[__name__].preferences
+            body.prop(prefs, "project_dir", text="Save Folder")
+            row = body.row(align=True)
+            row.use_property_split = False
+            row.operator("world_builder.open_renders", icon='FILE_FOLDER')
+            row.operator("world_builder.save_world", icon='FILE_BLEND')
 
 
 class WBSettings(bpy.types.PropertyGroup):
     prompt: bpy.props.StringProperty(
-        name="World prompt", default="",
+        name="World prompt", default="", options={'TEXTEDIT_UPDATE'},
         description="Describe the world to build, e.g. 'a cozy medieval village at dusk'")
     style: bpy.props.EnumProperty(
         name="Style", default="LOWPOLY",
@@ -2000,7 +2446,7 @@ class WBSettings(bpy.types.PropertyGroup):
         name="Refine", default="",
         description="Feedback for the built world, e.g. 'raise the camera and add more trees'")
     shot_prompt: bpy.props.StringProperty(
-        name="Motion", default="",
+        name="Motion", default="", options={'TEXTEDIT_UPDATE'},
         description="Camera motion to program, e.g. 'slow 360 orbit around the village, gently descending'")
     shot_duration: bpy.props.FloatProperty(
         name="Seconds", default=5.0, min=1.0, max=60.0,
@@ -2093,17 +2539,30 @@ class WB_prefs(bpy.types.AddonPreferences):
 
 
 classes = (WBSettings, WB_OT_build, WB_OT_refine, WB_OT_shot, WB_OT_film, WB_OT_retake, WB_OT_clear_rig,
-           WB_OT_cancel, WB_OT_open_renders, WB_OT_save_world, WB_PT_panel, WB_PT_shot, WB_PT_settings,
-           WB_prefs)
+           WB_OT_cancel, WB_OT_open_renders, WB_OT_save_world, WB_OT_palette, WB_OT_overlay,
+           WB_PT_panel, WB_PT_shot, WB_PT_settings, WB_prefs)
+
+addon_keymaps = []
 
 
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.world_builder = bpy.props.PointerProperty(type=WBSettings)
+    kc = getattr(bpy.context.window_manager, "keyconfigs", None)
+    if kc and kc.addon:  # headless/background Blender has no addon keyconfig
+        km = kc.addon.keymaps.new(name="3D View", space_type='VIEW_3D')
+        kmi = km.keymap_items.new("world_builder.overlay", 'P', 'PRESS', ctrl=True, shift=True)
+        addon_keymaps.append((km, kmi))
 
 
 def unregister():
+    if WB_OT_overlay._handle:  # addon disabled while the bar was open
+        bpy.types.SpaceView3D.draw_handler_remove(WB_OT_overlay._handle, 'WINDOW')
+        WB_OT_overlay._handle = None
+    for km, kmi in addon_keymaps:
+        km.keymap_items.remove(kmi)
+    addon_keymaps.clear()
     del bpy.types.Scene.world_builder
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
