@@ -715,18 +715,23 @@ def log(line):
     state["log"] = (state["log"] + [line])[-60:]
 
 
+# Fixed machine-level key file: survives Blender wiping addon prefs on disable, and lets the
+# project/save folder move freely without dragging the API keys along with it.
+GLOBAL_ENV = os.path.expanduser("~/.config/worldbuilder/.env")
+
+
 def env_lookup(prefs, var):
-    """os env, then the project .env file, for one variable. Main or worker thread (no bpy)."""
+    """os env, then explicit env_path, project .env, and the global .env. No bpy — any thread."""
     if os.environ.get(var):
         return os.environ[var]
-    env_file = (os.path.expanduser(prefs.env_path) if prefs.env_path.strip()
-                else os.path.join(get_dirs(prefs)[0], ".env"))
-    try:
-        for line in open(env_file):
-            if line.strip().startswith(var):
-                return line.split("=", 1)[1].strip().strip("'\"")
-    except OSError:
-        pass
+    explicit = os.path.expanduser(prefs.env_path) if prefs.env_path.strip() else None
+    for env_file in filter(None, [explicit, os.path.join(get_dirs(prefs)[0], ".env"), GLOBAL_ENV]):
+        try:
+            for line in open(env_file):
+                if line.strip().startswith(var):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+        except OSError:
+            pass
     return None
 
 
@@ -2074,7 +2079,8 @@ class WB_prefs(bpy.types.AddonPreferences):
                     "Leave empty to use the POLYPIZZA_API_KEY env var or the .env file")
     env_path: bpy.props.StringProperty(
         name=".env path", subtype='FILE_PATH', default="",
-        description="Optional; empty = <project folder>/.env")
+        description="Optional extra .env; <project folder>/.env and ~/.config/worldbuilder/.env "
+                    "are always checked as fallbacks")
     claude_path: bpy.props.StringProperty(
         name="claude CLI path", subtype='FILE_PATH', default=_find_claude())
 

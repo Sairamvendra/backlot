@@ -39,3 +39,24 @@ def test_env_lookup_reads_env_file(tmp_path, monkeypatch):
     assert wb.env_lookup(P(), "OPENROUTER_API_KEY") == "or-123"
     assert wb.polypizza_key(P()) == "pp-456"
     assert wb.api_key(P()) == "or-123"
+
+
+def test_env_lookup_global_fallback_and_precedence(tmp_path, monkeypatch):
+    class P:  # prefs whose project folder moved somewhere with no .env
+        project_dir = str(tmp_path / "renders-here")
+        env_path = ""
+        api_key = ""
+        polypizza_key = ""
+    (tmp_path / "renders-here").mkdir()
+    g = tmp_path / "global.env"
+    g.write_text("OPENROUTER_API_KEY=or-global\nPOLYPIZZA_API_KEY=pp-global\n")
+    monkeypatch.setattr(wb, "GLOBAL_ENV", str(g))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("POLYPIZZA_API_KEY", raising=False)
+    # no project .env -> the global file answers
+    assert wb.api_key(P()) == "or-global"
+    assert wb.polypizza_key(P()) == "pp-global"
+    # a project .env still wins over the global one
+    (tmp_path / "renders-here" / ".env").write_text("OPENROUTER_API_KEY=or-project\n")
+    assert wb.api_key(P()) == "or-project"
+    assert wb.polypizza_key(P()) == "pp-global"  # missing vars fall through per-variable

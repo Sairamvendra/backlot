@@ -32,7 +32,9 @@ selector) or local headless Claude Code (runs on your subscription).
 
 - **Project folder** — where `renders/`, `worlds/`, `steps/`, and `.env` live (default `~/Documents/WorldBuilder`).
 - **OpenRouter API key** — paste it here, **or** export `OPENROUTER_API_KEY`, **or** put
-  `OPENROUTER_API_KEY=...` in `<project folder>/.env`. Never commit `.env` (see `.gitignore`).
+  `OPENROUTER_API_KEY=...` in `<project folder>/.env`, **or** in `~/.config/worldbuilder/.env` —
+  the recommended spot: it survives Blender resetting add-on preferences and stays put when you
+  move the project folder. Never commit `.env` (see `.gitignore`).
 - **Poly Pizza API key** (optional) — free key from [poly.pizza/api](https://poly.pizza/api), only
   needed for CC0 asset import in Low Poly/Stylized styles; same three ways (`POLYPIZZA_API_KEY`).
 - **claude CLI path** — auto-detected; only needed for the Claude Code backend.
