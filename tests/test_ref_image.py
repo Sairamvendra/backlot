@@ -27,7 +27,7 @@ def test_image_part_kind_case_insensitive(tmp_path):
 
 
 def test_claude_prompt_mentions_ref_image_only_when_set():
-    cfg = {"add_mode": False, "style": "LOWPOLY", "detail": "QUICK", "extra": "",
+    cfg = {"mode": "REPLACE", "style": "LOWPOLY", "detail": "QUICK", "extra": "",
            "passes": 0, "render_dir": "/tmp", "slug": "x", "project_dir": "/tmp",
            "exec_helper": "/tmp/wb_exec.py"}
     assert "REFERENCE IMAGE" not in wb.claude_prompt("a village", cfg)

@@ -152,6 +152,15 @@ Do NOT clear or delete anything that already exists. First call: inspect the exi
 content in free space, matching the existing scale, style, and lighting. Camera: only adjust it
 if the new content is not visible."""
 
+FLOW_REMASTER = """
+REMASTER the existing scene: study it, then upgrade it IN PLACE to the requested style and detail.
+Do NOT clear the scene. First call: inspect it (object names, bounding boxes, materials, collections)
+and set `result` to that summary. The existing layout, proportions, and composition are the ground
+truth — keep every object's position, footprint, and role. Then upgrade group by group, one logical
+group per call: replace or refine placeholder/low-poly objects with more detailed versions in the
+same spot at the same scale (real profiles, bevels, subdivision, ornament and trim, richer materials,
+small supporting props), then relight to match the target style, camera only if nothing is framed."""
+
 STYLES = {
     "LOWPOLY": "Style: clean low-poly. Principled BSDF materials with distinct flat base colors; no image textures.",
     "STYLIZED": "Style: stylized and playful — chunky exaggerated proportions, saturated colors, soft toon-like lighting; no image textures.",
@@ -306,9 +315,13 @@ def director_system(kind):
 def director_task(task_text, cfg, kind):
     if kind == "scene":
         parts = [STYLES[cfg["style"]] or "Style: user-defined.", DETAILS[cfg["detail"]]]
-        if cfg["add_mode"]:
+        if cfg.get("mode") == "ADD":
             parts.append("NOTE: this ADDS to an existing scene — brief only the new content and how it "
                          "ties in with what exists; do not re-plan the whole scene.")
+        elif cfg.get("mode") == "REMASTER":
+            parts.append("NOTE: this REMASTERS an existing scene — keep its layout, proportions, and "
+                         "composition; brief how to upgrade what already exists to the target style "
+                         "and detail, not a new scene.")
         if cfg["extra"].strip():
             parts.append("User requirements: " + cfg["extra"].strip())
         parts.append("SCENE REQUEST: " + task_text)
@@ -630,6 +643,96 @@ wb = sys.modules[__MODULE__]
 result = {"removed": wb.do_clear_rig(bpy.context.scene)}
 """
 
+# Bake the EVALUATED active camera per frame (marker-bound switches resolved manually) — ground
+# truth of the take's camera move no matter how the model rigged it. Lets Rerender replay it later.
+BAKE_CAM_CODE = """
+import bpy
+scene = bpy.context.scene
+frames = __FRAMES__
+mk = sorted([(m.frame, m.camera) for m in scene.timeline_markers if m.camera], key=lambda t: t[0])
+cur = scene.frame_current
+rows, static = [], None
+for f in range(1, frames + 1):
+    scene.frame_set(f)
+    cam = scene.camera
+    for mf, mc in mk:
+        if mf <= f:
+            cam = mc
+    if cam is None:
+        break
+    deps = bpy.context.evaluated_depsgraph_get()
+    ce = cam.evaluated_get(deps)
+    loc, rot, _ = ce.matrix_world.decompose()
+    d = ce.data
+    rows.append([loc.x, loc.y, loc.z, rot.w, rot.x, rot.y, rot.z, d.lens])
+    if static is None:
+        static = {"lens": d.lens, "sensor_width": d.sensor_width, "shift_x": d.shift_x,
+                  "shift_y": d.shift_y, "clip_start": d.clip_start, "clip_end": d.clip_end,
+                  "use_dof": d.dof.use_dof, "focus_distance": d.dof.focus_distance,
+                  "aperture_fstop": d.dof.aperture_fstop}
+scene.frame_set(cur)
+result = {"bake": {"fps": __FPS__, "frames": rows, "static": static} if rows else None}
+"""
+
+# Rebuild a take's camera move from its bake onto one fresh unconstrained camera.
+REPLAY_RIG_CODE = """
+import bpy, json
+bake = json.loads(__BAKE__)  # __BAKE__ is a JSON string literal — json booleans aren't python
+scene = bpy.context.scene
+old = bpy.data.objects.get("WB_Rerender")
+if old:
+    bpy.data.objects.remove(old, do_unlink=True)
+oldd = bpy.data.cameras.get("WB_Rerender")
+if oldd:
+    bpy.data.cameras.remove(oldd)
+camd = bpy.data.cameras.new("WB_Rerender")
+st = bake["static"]
+camd.lens = st["lens"]
+camd.sensor_width = st["sensor_width"]
+camd.shift_x, camd.shift_y = st["shift_x"], st["shift_y"]
+camd.clip_start, camd.clip_end = st["clip_start"], st["clip_end"]
+camd.dof.use_dof = st["use_dof"]
+camd.dof.focus_distance = st["focus_distance"]
+camd.dof.aperture_fstop = st["aperture_fstop"]
+cam = bpy.data.objects.new("WB_Rerender", camd)
+scene.collection.objects.link(cam)
+cam.rotation_mode = 'QUATERNION'
+rows = bake["frames"]
+lenses = [r[7] for r in rows]
+animate_lens = max(lenses) - min(lenses) > 1e-4
+prev = None
+# ponytail: per-frame keyframe_insert is O(n^2)-ish; batch via fcurve foreach_set if long takes crawl
+for f, r in enumerate(rows, start=1):
+    cam.location = r[0:3]
+    q = r[3:7]
+    if prev is not None and sum(a * b for a, b in zip(q, prev)) < 0:
+        q = [-c for c in q]  # keep quaternion sign continuous so interpolation never spins
+    prev = q
+    cam.rotation_quaternion = q
+    cam.keyframe_insert("location", frame=f)
+    cam.keyframe_insert("rotation_quaternion", frame=f)
+    if animate_lens:
+        camd.lens = r[7]
+        camd.keyframe_insert("lens", frame=f)
+scene.camera = cam
+scene.frame_set(1)
+result = {"rig": cam.name, "frames": len(rows), "lens_animated": animate_lens}
+"""
+
+RERENDER_CLEANUP_CODE = """
+import bpy
+cam = bpy.data.objects.get("WB_Rerender")
+if cam:
+    bpy.data.objects.remove(cam, do_unlink=True)
+camd = bpy.data.cameras.get("WB_Rerender")
+if camd:
+    bpy.data.cameras.remove(camd)
+orig = bpy.data.objects.get("Camera")
+if orig and orig.name in bpy.context.scene.objects:
+    bpy.context.scene.camera = orig
+result = {"cleaned": True}
+"""
+
 ASSEMBLE_CODE = """
 import bpy, os
 paths, out = __PATHS__, __OUT__
@@ -833,8 +936,8 @@ def fetch_asset(query, cfg):
 
 
 def build_system(cfg):
-    parts = [BASE_RULES, FLOW_ADD if cfg["add_mode"] else FLOW_REPLACE,
-             STYLES[cfg["style"]], DETAILS[cfg["detail"]]]
+    flow = {"ADD": FLOW_ADD, "REMASTER": FLOW_REMASTER}.get(cfg.get("mode"), FLOW_REPLACE)
+    parts = [BASE_RULES, flow, STYLES[cfg["style"]], DETAILS[cfg["detail"]]]
     if cfg.get("assets"):
         src = "PolyHaven photoscans" if cfg["style"] == "REALISTIC" else "Kenney/Quaternius low-poly packs"
         parts.append(
@@ -890,11 +993,16 @@ def director_brief(task_text, key, cfg, kind):
     state["status"] = f"{role} drafting brief..."
     try:
         task = director_task(task_text, cfg, kind)
+        labels, imgs = [], []
+        if cfg.get("scene_shot"):
+            labels.append("a render of the CURRENT scene being remastered")
+            imgs.append(image_part(cfg["scene_shot"]))
         if cfg.get("ref_image"):
-            task = [{"type": "text", "text": task +
-                     "\n\nThe user's reference image is attached — ground the brief in its "
-                     "objects, layout, and mood."},
-                    image_part(cfg["ref_image"])]
+            labels.append("the user's reference image")
+            imgs.append(image_part(cfg["ref_image"]))
+        if imgs:
+            task = [{"type": "text", "text": task + "\n\nAttached: " + " and ".join(labels) +
+                     " — ground the brief in what you see."}] + imgs
         raw = chat([{"role": "system", "content": director_system(kind)},
                     {"role": "user", "content": task}],
                    key, cfg, tools=False)
@@ -1086,6 +1194,7 @@ def record_shot(cfg):
     code = (template.replace("__W__", str(w)).replace("__H__", str(h))
             .replace("__FPS__", str(cfg["fps"])).replace("__FRAMES__", str(frames))
             .replace("__PATH__", json.dumps(path)).replace("__MODULE__", json.dumps(__name__)))
+    state["last_bake"] = None
     state["record_done"] = False
     state["recording"] = True
     budget = frames * 20 + 300
@@ -1104,6 +1213,13 @@ def record_shot(cfg):
         state["recording"] = False
     if state["record_done"] is True and os.path.exists(path):
         log("shot saved: renders/" + name)
+        try:  # bake the camera move so this take can be re-recorded later without the LLM
+            bake_code = (BAKE_CAM_CODE.replace("__FRAMES__", str(frames))
+                         .replace("__FPS__", str(cfg["fps"])))
+            resp = json.loads(exec_on_main(bake_code, timeout=frames * 2 + 120))
+            state["last_bake"] = (resp.get("result") or {}).get("bake")
+        except Exception as e:
+            log(f"camera bake skipped: {str(e)[:60]}")
         return path
     if state["record_done"] == "cancelled":
         log("recording cancelled in the render window")
@@ -1225,7 +1341,8 @@ def worker_film(task_text, key, cfg):
             path = shoot(task_text, key, cfg, brief)
             state["film_brief"] = brief
             state["shots"] = [{"name": cfg["slug"][:24], "prompt": task_text,
-                               "seconds": cfg["duration"], "path": path}]
+                               "seconds": cfg["duration"], "path": path,
+                               "bake": state.pop("last_bake", None)}]
             state["status"] = "cancelled" if state["cancel"] else "done"
             return
         state["film_brief"] = brief
@@ -1247,6 +1364,7 @@ def worker_film(task_text, key, cfg):
                 s["path"] = shoot(task, key, scfg, state["film_brief"])
             except Exception as e:  # a broken take never kills the film — later takes + assembly still run
                 log(f"  shot error: {str(e)[:80]}")
+            s["bake"] = state.pop("last_bake", None)
             log(("  recorded " + os.path.basename(s["path"])) if s["path"] else "  shot failed — continuing")
         if not state["cancel"]:
             assemble_film(cfg)
@@ -1280,8 +1398,63 @@ def worker_retake(ix, note, key, cfg):
         path = shoot(retake_task(s, note), key, scfg, state.get("film_brief"))
         if path:
             s["path"] = path
+            s["bake"] = state.pop("last_bake", None)
         else:
             log("retake failed — keeping the previous take")
+        if len(state["shots"]) > 1 and not state["cancel"]:
+            assemble_film(cfg)
+        state["status"] = "cancelled" if state["cancel"] else "done"
+    except Exception as e:
+        log(f"FAILED: {e}")
+        state["status"] = "failed"
+    finally:
+        state["proc"] = None
+        state["running"] = False
+
+
+def worker_rerender(ix, cfg):
+    """No-LLM re-record: replay the take's baked camera move on the current scene, replace its video."""
+    try:
+        state["started"] = time.time()
+        s = state["shots"][ix]
+        log(f"rerender {ix + 1}/{len(state['shots'])}: {s['name']}")
+        bake = s.get("bake")
+        if not bake:
+            # take predates baking — the live scene rig is only trustworthy for the last-recorded take
+            recorded = [i for i, t in enumerate(state["shots"]) if t.get("path")]
+            if not recorded or ix != recorded[-1]:
+                log("no saved camera move for this take — use Retake to re-plan it")
+                state["status"] = "failed"
+                return
+            log("no saved camera move — baking the rig currently in the scene")
+            frames = max(int(s["seconds"] * cfg["fps"]), 1)
+            code = (BAKE_CAM_CODE.replace("__FRAMES__", str(frames))
+                    .replace("__FPS__", str(cfg["fps"])))
+            bake = json.loads(exec_on_main(code, timeout=frames * 2 + 120)).get("result", {}).get("bake")
+            if not bake:
+                log("nothing to bake — no camera in the scene")
+                state["status"] = "failed"
+                return
+            s["bake"] = bake
+        try:
+            exec_on_main(CLEAR_RIG_CODE.replace("__MODULE__", json.dumps(__name__)))
+        except queue.Empty:
+            pass
+        state["status"] = "replaying camera move..."
+        exec_on_main(REPLAY_RIG_CODE.replace("__BAKE__", json.dumps(json.dumps(bake))),
+                     timeout=len(bake["frames"]) + 300)
+        scfg = {**cfg, "duration": len(bake["frames"]) / bake["fps"], "fps": bake["fps"],
+                "slug": f"{cfg['slug'][:20]}-s{ix + 1:02d}-{s['name']}-rr"[:56]}
+        path = record_shot(scfg)
+        state.pop("last_bake", None)  # replay of the same bake — nothing new to keep
+        try:
+            exec_on_main(RERENDER_CLEANUP_CODE)
+        except queue.Empty:
+            pass
+        if path:
+            s["path"] = path
+        else:
+            log("rerender failed — keeping the previous video")
         if len(state["shots"]) > 1 and not state["cancel"]:
             assemble_film(cfg)
         state["status"] = "cancelled" if state["cancel"] else "done"
@@ -1303,7 +1476,8 @@ def worker_shot(task_text, key, cfg):
         path = shoot(task_text, key, cfg, brief)
         state["film_brief"] = brief
         state["shots"] = [{"name": cfg["slug"][:24], "prompt": task_text,
-                           "seconds": cfg["duration"], "path": path}]
+                           "seconds": cfg["duration"], "path": path,
+                           "bake": state.pop("last_bake", None)}]
         state["status"] = "cancelled" if state["cancel"] else "done"
     except Exception as e:
         log(f"FAILED: {e}")
@@ -1328,16 +1502,29 @@ def worker(task_text, key, cfg, resume=False):
                 content.append(image_part(state["last_render"]))
             messages.append({"role": "user", "content": content})
         else:
+            if cfg.get("mode") == "REMASTER":
+                state["status"] = "rendering current scene..."
+                shot = render_to(CRITIQUE_RENDER, cfg, "before", half=True)
+                if shot:
+                    cfg["scene_shot"] = shot
+                else:
+                    log("could not render the current scene — remastering from inspection only")
             brief = director_brief(task_text, key, cfg, "scene")
             if brief:
                 task_text += "\n\n=== CREATIVE DIRECTOR'S BRIEF (build to this) ===\n" + brief
-            user_content = task_text
+            intro, imgs = [], []
+            if cfg.get("scene_shot"):
+                intro.append("a render of the CURRENT scene you are remastering — study it and "
+                             "keep its layout")
+                imgs.append(image_part(cfg["scene_shot"]))
             if cfg.get("ref_image"):
+                intro.append("the user's reference image — identify its key objects, layout, and "
+                             "mood, and match it")
+                imgs.append(image_part(cfg["ref_image"]))
+            user_content = task_text
+            if imgs:
                 user_content = [{"type": "text", "text":
-                                 "A reference image is attached. Identify its key objects, layout, "
-                                 "and mood, and build the scene to match it, guided by this request:"
-                                 "\n\n" + task_text},
-                                image_part(cfg["ref_image"])]
+                                 "Attached: " + "; ".join(intro) + ".\n\n" + task_text}] + imgs
             messages = [{"role": "system", "content": build_system(cfg)},
                         {"role": "user", "content": user_content}]
         passes_left = cfg["passes"]
@@ -1387,7 +1574,7 @@ def worker(task_text, key, cfg, resume=False):
             messages.append({"role": "user",
                              "content": "Continue building with run_blender, or reply DONE: <summary> if finished."})
         if not state["cancel"]:
-            if not cfg["add_mode"] and not resume:
+            if cfg.get("mode") != "ADD" and not resume:
                 try:
                     exec_on_main(PURGE_COLLECTIONS)
                 except queue.Empty:
@@ -1429,7 +1616,7 @@ def claude_prompt(task, cfg):
         "to avoid). Ground it in these principles:\n" + CREATIVE_KB +
         "\nThen build the scene TO THAT BRIEF and judge every critique render against it.",
         "Build incrementally — one logical group per script run. Rules for the Blender code:\n" + SCENE_RULES,
-        FLOW_ADD if cfg["add_mode"] else FLOW_REPLACE,
+        {"ADD": FLOW_ADD, "REMASTER": FLOW_REMASTER}.get(cfg.get("mode"), FLOW_REPLACE),
         STYLES[cfg["style"]],
         DETAILS[cfg["detail"]].replace("tool calls", "script runs"),
     ]
@@ -1452,6 +1639,10 @@ def claude_prompt(task, cfg):
             "and place/scale it. Keep terrain and buildings procedural.")
     if cfg["extra"].strip():
         parts.append("Additional user requirements (high priority): " + cfg["extra"].strip())
+    if cfg.get("scene_shot"):
+        parts.append(
+            "CURRENT SCENE RENDER: " + cfg["scene_shot"] + " — Read this image FIRST and study the "
+            "existing scene before changing anything; it is what you are remastering.")
     if cfg.get("ref_image"):
         parts.append(
             "REFERENCE IMAGE: the user attached a reference photo at " + cfg["ref_image"] +
@@ -1551,12 +1742,17 @@ def worker_claude(task_text, cfg, resume):
                       + "Modify the existing scene via the Blender helper (do NOT clear or rebuild from "
                         "scratch unless the feedback asks for it). End with one line: DONE: <summary>.")
         else:
+            if cfg.get("mode") == "REMASTER":
+                state["status"] = "rendering current scene..."
+                shot = render_to(CRITIQUE_RENDER, cfg, "before", half=True)
+                if shot:
+                    cfg["scene_shot"] = shot
             prompt = claude_prompt(task_text, cfg)
         ok, sid, _text = run_claude(prompt, cfg, resume_sid=state.get("claude_session") if resume else None)
         if sid:
             state["claude_session"] = sid
         if not state["cancel"]:
-            if not cfg["add_mode"] and not resume:
+            if cfg.get("mode") != "ADD" and not resume:
                 try:
                     exec_on_main(PURGE_COLLECTIONS)
                 except queue.Empty:
@@ -1619,7 +1815,7 @@ def start_worker(context, task_text, resume):
     root, render_dir, _ = get_dirs(prefs)
     cfg = {"model": s.model, "custom_model": s.custom_model, "reasoning": s.reasoning,
            "passes": s.vision_passes, "resolution": res, "style": s.style, "detail": s.detail,
-           "add_mode": s.add_mode, "extra": s.extra,
+           "mode": s.build_mode, "extra": s.extra,
            "claude_model": s.claude_model, "claude_bin": prefs.claude_path,
            "project_dir": root, "render_dir": render_dir,
            "slug": re.sub(r"[^a-z0-9]+", "-", (s.prompt or "world").lower())[:40].strip("-") or "world"}
@@ -1654,21 +1850,24 @@ def start_worker(context, task_text, resume):
     return None
 
 
-def shot_cfg(context, task_text):
-    """Main thread: build the shot cfg dict from settings. Returns (cfg, err) — err is a user message."""
+def shot_cfg(context, task_text, need_key=True):
+    """Main thread: build the shot cfg dict from settings. Returns (cfg, err) — err is a user message.
+    need_key=False skips the backend checks for LLM-free work (rerenders)."""
     s = context.scene.world_builder
     prefs = context.preferences.addons[__name__].preferences
     res = RESOLUTIONS[s.resolution]
     root, render_dir, _ = get_dirs(prefs)
     cfg = {"model": s.model, "custom_model": s.custom_model, "reasoning": s.reasoning,
            "passes": s.vision_passes, "resolution": res, "style": s.style, "detail": s.detail,
-           "add_mode": s.add_mode, "extra": s.extra,
+           "mode": s.build_mode, "extra": s.extra,
            "claude_model": s.claude_model, "claude_bin": prefs.claude_path,
            "project_dir": root, "render_dir": render_dir,
            "duration": s.shot_duration, "fps": int(s.shot_fps), "final_quality": s.shot_final,
            "multicut": s.shot_multicut, "multicut_n": s.shot_cuts,
            "multicam": s.shot_multicam, "multicam_n": s.shot_cams, "key": None,
            "slug": re.sub(r"[^a-z0-9]+", "-", task_text.lower())[:40].strip("-") or "shot"}
+    if not need_key:
+        return cfg, None
     if s.model == "CLAUDE_CODE":
         if not os.path.exists(prefs.claude_path):
             return None, "claude CLI not found — set its path in Add-on Preferences"
@@ -1716,6 +1915,19 @@ def start_retake(context, ix, note):
     return None
 
 
+def start_rerender(context, ix):
+    """Main thread: re-record take ix with its saved camera move — no LLM involved."""
+    if not (0 <= ix < len(state["shots"])):
+        return f"No shot {ix + 1} — the last run recorded {len(state['shots'])} shot(s)"
+    cfg, err = shot_cfg(context, state["shots"][ix]["name"], need_key=False)
+    if err:
+        return err
+    state.update(running=True, cancel=False, status="starting rerender...", record_done=False)
+    threading.Thread(target=worker_rerender, args=(ix, cfg), daemon=True).start()
+    bpy.app.timers.register(pump, first_interval=0.2)
+    return None
+
+
 # ------------------------------------------------------------ operators
 
 class WB_OT_build(bpy.types.Operator):
@@ -1728,7 +1940,7 @@ class WB_OT_build(bpy.types.Operator):
         return not state["running"]
 
     def invoke(self, context, event):
-        if context.scene.world_builder.add_mode:
+        if context.scene.world_builder.build_mode == "ADD":
             return self.execute(context)  # additive builds don't destroy anything
         return context.window_manager.invoke_confirm(self, event)
 
@@ -1737,7 +1949,7 @@ class WB_OT_build(bpy.types.Operator):
         if not s.prompt.strip():
             self.report({'ERROR'}, "Type a world description first")
             return {'CANCELLED'}
-        if not s.add_mode and s.backup and len(context.scene.objects) > 0:
+        if s.build_mode != "ADD" and s.backup and len(context.scene.objects) > 0:
             worlds = get_dirs(context.preferences.addons[__name__].preferences)[2]
             os.makedirs(worlds, exist_ok=True)
             try:
@@ -1839,6 +2051,26 @@ class WB_OT_retake(bpy.types.Operator):
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
         s.retake_note = ""
+        return {'FINISHED'}
+
+
+class WB_OT_rerender(bpy.types.Operator):
+    bl_idname = "world_builder.rerender"
+    bl_label = "Rerender Take"
+    bl_description = ("Re-record this take with the exact same camera move on the current scene "
+                      "and replace its video — no AI replanning; use after fixing the world")
+
+    index: bpy.props.IntProperty(default=0, options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return not state["running"] and bool(state["shots"])
+
+    def execute(self, context):
+        err = start_rerender(context, self.index)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 
@@ -2321,7 +2553,7 @@ class WB_PT_panel(bpy.types.Panel):
         header.label(text="Build Options", icon='OPTIONS')
         if body:
             bcol = body.column()
-            bcol.prop(s, "add_mode")
+            bcol.prop(s, "build_mode", text="")
             bcol.prop(s, "use_assets")
             bcol.prop(s, "extra", text="", icon='TEXT',
                       placeholder="night time, no cacti, add a river")
@@ -2421,8 +2653,12 @@ class WB_PT_shot(bpy.types.Panel):
                 box = body.box().column(align=True)
                 box.scale_y = 0.9
                 for i, sh in enumerate(state["shots"]):
-                    box.label(text=f"{i + 1:02d}  {sh['name'][:28]}",
+                    row = box.row(align=True)
+                    row.label(text=f"{i + 1:02d}  {sh['name'][:24]}",
                               icon='CHECKMARK' if sh.get('path') else 'ERROR')
+                    if sh.get("path"):
+                        row.operator("world_builder.rerender", text="",
+                                     icon='RENDER_ANIMATION').index = i
                 bcol = body.column(align=True)
                 row = bcol.row(align=True)
                 row.prop(s, "retake_index")
@@ -2496,9 +2732,13 @@ class WBSettings(bpy.types.PropertyGroup):
         items=[("QUICK", "Quick", "4-6 build steps, essential forms"),
                ("STANDARD", "Standard", "6-12 build steps"),
                ("DETAILED", "Detailed", "12-20 build steps, more variety and props")])
-    add_mode: bpy.props.BoolProperty(
-        name="Add to current scene", default=False,
-        description="Build into the existing scene instead of replacing it")
+    build_mode: bpy.props.EnumProperty(
+        name="Mode", default="REPLACE",
+        items=[("REPLACE", "New World", "Clear the scene and build fresh from the prompt"),
+               ("ADD", "Add to Scene", "Build new content into the existing scene, keeping everything"),
+               ("REMASTER", "Remaster Scene",
+                "Study the existing scene (inventory + render) and upgrade it in place to the chosen "
+                "style and detail — e.g. turn a low-poly draft into a detailed version")])
     extra: bpy.props.StringProperty(
         name="Extra instructions", default="",
         description="Optional extra requirements, e.g. 'night time, no cacti, add a river'")
@@ -2607,7 +2847,8 @@ class WB_prefs(bpy.types.AddonPreferences):
         self.layout.prop(self, "claude_path")
 
 
-classes = (WBSettings, WB_OT_build, WB_OT_refine, WB_OT_shot, WB_OT_film, WB_OT_retake, WB_OT_clear_rig,
+classes = (WBSettings, WB_OT_build, WB_OT_refine, WB_OT_shot, WB_OT_film, WB_OT_retake, WB_OT_rerender,
+           WB_OT_clear_rig,
            WB_OT_cancel, WB_OT_open_renders, WB_OT_save_world, WB_OT_palette, WB_OT_overlay,
            WB_PT_panel, WB_PT_shot, WB_PT_settings, WB_prefs)
 
